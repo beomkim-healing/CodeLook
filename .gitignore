@@ -1,0 +1,8 @@
+# Rust build output
+/target
+
+# Built macOS app bundle (produced by make_app.sh)
+/CodeLook.app
+
+# macOS
+.DS_Store

@@ -1,0 +1,39 @@
+[package]
+name = "codelook"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight read-only source code viewer with IntelliJ-like UI"
+
+[[bin]]
+name = "codelook"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+syntect = "5.2"
+rfd = "0.15"
+ignore = "0.4"
+regex = "1"
+tree-sitter = "0.26.9"
+tree-sitter-rust = "0.24.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-go = "0.25.0"
+tree-sitter-kotlin-ng = "1.1.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-highlight = "0.26.9"
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+png = { version = "0.17", optional = true }
+
+[features]
+# Build with `--features shot` to enable `--shot <out.png>` capture mode
+# (used by the design-review loop). Excluded from the default/release build.
+shot = ["dep:png"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>name</key>
+  <string>Darcula</string>
+  <key>settings</key>
+  <array>
+    <dict>
+      <key>settings</key>
+      <dict>
+        <key>background</key><string>#2B2B2B</string>
+        <key>foreground</key><string>#A9B7C6</string>
+        <key>caret</key><string>#BBBBBB</string>
+        <key>selection</key><string>#214283</string>
+        <key>lineHighlight</key><string>#323232</string>
+        <key>invisibles</key><string>#3B3B3B</string>
+      </dict>
+    </dict>
+
+    <dict>
+      <key>name</key><string>Comment</string>
+      <key>scope</key><string>comment, punctuation.definition.comment</string>
+      <key>settings</key><dict><key>foreground</key><string>#808080</string><key>fontStyle</key><string>italic</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Doc comment</string>
+      <key>scope</key><string>comment.block.documentation, comment.line.documentation</string>
+      <key>settings</key><dict><key>foreground</key><string>#629755</string><key>fontStyle</key><string>italic</string></dict>
+    </dict>
+
+    <dict>
+      <key>name</key><string>Keyword</string>
+      <key>scope</key><string>keyword, keyword.control, keyword.other, storage, storage.type, storage.modifier</string>
+      <key>settings</key><dict><key>foreground</key><string>#CC7832</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Operator</string>
+      <key>scope</key><string>keyword.operator, punctuation, meta.brace</string>
+      <key>settings</key><dict><key>foreground</key><string>#A9B7C6</string></dict>
+    </dict>
+
+    <dict>
+      <key>name</key><string>String</string>
+      <key>scope</key><string>string, string.quoted, punctuation.definition.string</string>
+      <key>settings</key><dict><key>foreground</key><string>#6A8759</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Escape / template</string>
+      <key>scope</key><string>constant.character.escape, string.regexp, meta.template.expression, punctuation.section.embedded</string>
+      <key>settings</key><dict><key>foreground</key><string>#CC7832</string></dict>
+    </dict>
+
+    <dict>
+      <key>name</key><string>Number</string>
+      <key>scope</key><string>constant.numeric, constant.numeric.float, constant.numeric.integer</string>
+      <key>settings</key><dict><key>foreground</key><string>#6897BB</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Language constant</string>
+      <key>scope</key><string>constant.language, support.constant</string>
+      <key>settings</key><dict><key>foreground</key><string>#CC7832</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Named constant</string>
+      <key>scope</key><string>constant.other, variable.other.constant, entity.name.constant</string>
+      <key>settings</key><dict><key>foreground</key><string>#9876AA</string></dict>
+    </dict>
+
+    <dict>
+      <key>name</key><string>Function</string>
+      <key>scope</key><string>entity.name.function, support.function, meta.function-call, meta.function-call.generic</string>
+      <key>settings</key><dict><key>foreground</key><string>#FFC66D</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Method call</string>
+      <key>scope</key><string>variable.function, support.function.builtin</string>
+      <key>settings</key><dict><key>foreground</key><string>#FFC66D</string></dict>
+    </dict>
+
+    <dict>
+      <key>name</key><string>Type / class</string>
+      <key>scope</key><string>entity.name.type, entity.name.class, entity.name.struct, entity.name.enum, entity.name.trait, support.type, support.class, meta.type.name</string>
+      <key>settings</key><dict><key>foreground</key><string>#A9B7C6</string></dict>
+    </dict>
+
+    <dict>
+      <key>name</key><string>Self / this</string>
+      <key>scope</key><string>variable.language, variable.language.this, variable.language.self</string>
+      <key>settings</key><dict><key>foreground</key><string>#CC7832</string><key>fontStyle</key><string>italic</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Instance field</string>
+      <key>scope</key><string>variable.other.member, variable.other.property, meta.attribute</string>
+      <key>settings</key><dict><key>foreground</key><string>#9876AA</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Parameter</string>
+      <key>scope</key><string>variable.parameter</string>
+      <key>settings</key><dict><key>foreground</key><string>#A9B7C6</string></dict>
+    </dict>
+
+    <dict>
+      <key>name</key><string>Annotation / decorator</string>
+      <key>scope</key><string>meta.annotation, storage.type.annotation, punctuation.definition.annotation, entity.name.function.decorator, meta.decorator, support.type.annotation</string>
+      <key>settings</key><dict><key>foreground</key><string>#BBB529</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Tag attribute</string>
+      <key>scope</key><string>entity.other.attribute-name</string>
+      <key>settings</key><dict><key>foreground</key><string>#BBB529</string></dict>
+    </dict>
+    <dict>
+      <key>name</key><string>Tag</string>
+      <key>scope</key><string>entity.name.tag</string>
+      <key>settings</key><dict><key>foreground</key><string>#E8BF6A</string></dict>
+    </dict>
+
+    <dict>
+      <key>name</key><string>Invalid</string>
+      <key>scope</key><string>invalid, invalid.illegal</string>
+      <key>settings</key><dict><key>foreground</key><string>#BC3F3C</string></dict>
+    </dict>
+  </array>
+</dict>
+</plist>
