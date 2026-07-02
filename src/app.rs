@@ -197,12 +197,16 @@ pub struct CodeLookApp {
     structure_open: bool,
     // Commit Log panel + diff viewer.
     log_open: bool,
+    /// Commit-list / file-list split as a fraction of the panel width.
+    log_split: f32,
     commits: Vec<crate::git::CommitInfo>,
     commits_rx: Option<Receiver<Vec<crate::git::CommitInfo>>>,
     commit_sel: usize,
     commit_files: Vec<crate::git::FileChange>,
     commit_files_for: String,
     diff_view: Option<DiffView>,
+    // IntelliJ expUI icon textures (files / folders / structure symbols).
+    icons: icons::IconSet,
     // Capture mode (design-review loop); None in normal use.
     shot: Option<crate::ShotConfig>,
     shot_frame: u32,
@@ -270,12 +274,14 @@ impl CodeLookApp {
             tree_open: true,
             structure_open: true,
             log_open: false,
+            log_split: 0.6,
             commits: Vec::new(),
             commits_rx: None,
             commit_sel: 0,
             commit_files: Vec::new(),
             commit_files_for: String::new(),
             diff_view: None,
+            icons: icons::IconSet::new(&cc.egui_ctx),
             shot,
             shot_frame: 0,
         };
@@ -711,11 +717,23 @@ impl CodeLookApp {
             return;
         }
 
-        // Prefer a definition in the current file (but not the exact line we're
-        // already on); otherwise take the first match.
+        // Prefer, in order: a definition in the current file (but not the line
+        // we're already on) → one in the same language as the current file →
+        // the first match. Keeps ⌘+Click in .kt from landing in unrelated
+        // languages when names collide.
+        let cur_lang = cur_path.as_deref().and_then(ast::Lang::from_path);
+        let cur_ext = cur_path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .map(|e| e.to_ascii_lowercase());
+        let same_lang = |l: &&crate::symbols::SymbolLoc| match (cur_lang, ast::Lang::from_path(&l.path)) {
+            (Some(a), Some(b)) => a == b,
+            _ => l.path.extension().map(|e| e.to_ascii_lowercase()) == cur_ext,
+        };
         let pick = matches
             .iter()
             .find(|l| Some(&l.path) == cur_path.as_ref() && Some(l.line) != cur_line)
+            .or_else(|| matches.iter().find(same_lang))
             .or_else(|| matches.first())
             .cloned()
             .unwrap();
@@ -1047,8 +1065,9 @@ impl CodeLookApp {
                             .map(|t| t.path.clone());
                         let mut to_open = None;
                         let status = &self.git_status;
+                        let icons = &self.icons;
                         if let Some(root) = &mut self.tree {
-                            show_node(ui, root, 0, active_path.as_deref(), status, &mut to_open);
+                            show_node(ui, root, 0, active_path.as_deref(), status, icons, &mut to_open);
                         } else {
                             ui.add_space(20.0);
                             ui.vertical_centered(|ui| {
@@ -1100,7 +1119,7 @@ impl CodeLookApp {
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             for s in &self.tabs[i].outline {
-                                if symbol_row(ui, s) {
+                                if symbol_row(ui, s, &self.icons) {
                                     jump = Some(s.line);
                                 }
                             }
@@ -1166,7 +1185,7 @@ impl CodeLookApp {
                         if is_file {
                             let badge =
                                 Rect::from_center_size(egui::pos2(x + 7.0, cy), Vec2::splat(14.0));
-                            icons::draw_file_icon(p, badge, &file_name);
+                            self.icons.file(p, badge, &file_name);
                             x = badge.right() + 5.0;
                         }
                         let color = if is_file { C_TEXT } else { C_TEXT_DIM };
@@ -1344,7 +1363,7 @@ impl CodeLookApp {
                                         egui::pos2(hr.left() + 9.0, hr.center().y),
                                         Vec2::splat(14.0),
                                     );
-                                    icons::draw_file_icon(p, badge, &name);
+                                    self.icons.file(p, badge, &name);
                                     p.text(
                                         egui::pos2(badge.right() + 6.0, hr.center().y),
                                         Align2::LEFT_CENTER,
@@ -1609,7 +1628,10 @@ impl CodeLookApp {
                 );
 
                 let body_h = ui.available_height();
-                let left_w = (ui.available_width() * 0.6).max(320.0);
+                let total_w = ui.available_width();
+                // Draggable split between the commit list and the file list.
+                let min_side = 240.0_f32.min(total_w * 0.3);
+                let left_w = (total_w * self.log_split).clamp(min_side, (total_w - min_side).max(min_side));
                 ui.horizontal_top(|ui| {
                     // Commit list.
                     ui.vertical(|ui| {
@@ -1662,9 +1684,22 @@ impl CodeLookApp {
                             });
                     });
 
-                    let (dr, _) = ui.allocate_exact_size(Vec2::new(9.0, body_h), Sense::hover());
+                    let (dr, dresp) =
+                        ui.allocate_exact_size(Vec2::new(9.0, body_h), Sense::click_and_drag());
+                    if dresp.hovered() || dresp.dragged() {
+                        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                    }
+                    if dresp.dragged() {
+                        let x = left_w + dresp.drag_delta().x;
+                        self.log_split = (x / total_w).clamp(0.12, 0.88);
+                    }
+                    let line_c = if dresp.hovered() || dresp.dragged() {
+                        C_ACCENT
+                    } else {
+                        C_BORDER
+                    };
                     ui.painter()
-                        .vline(dr.center().x, dr.y_range(), Stroke::new(1.0, C_BORDER));
+                        .vline(dr.center().x, dr.y_range(), Stroke::new(1.0, line_c));
 
                     // Changed files of the selected commit.
                     ui.vertical(|ui| {
@@ -1972,7 +2007,7 @@ impl CodeLookApp {
                                     egui::pos2(rect.left() + 16.0, rect.center().y),
                                     Vec2::splat(15.0),
                                 );
-                                icons::draw_file_icon(p, icon, &name);
+                                self.icons.file(p, icon, &name);
                                 p.text(
                                     egui::pos2(icon.right() + 6.0, rect.center().y),
                                     egui::Align2::LEFT_CENTER,
@@ -2118,6 +2153,12 @@ impl CodeLookApp {
         let gutter_job = tab.gutter_job.clone();
         let code_w = tab.code_w;
 
+        // Make the TextEdit cover at least the whole visible pane, so the
+        // empty space below a short file still behaves like the editor
+        // (I-beam cursor, click places the caret, drag selects).
+        let view_h = ui.available_height();
+        let min_rows = ui.fonts(|f| (view_h / f.row_height(&font)).floor().max(1.0) as usize);
+
         egui::ScrollArea::both()
             .id_salt("editor_scroll")
             .auto_shrink([false, false])
@@ -2174,6 +2215,7 @@ impl CodeLookApp {
                         .font(font.clone())
                         .frame(false)
                         .desired_width(code_w.max(ui.available_width()))
+                        .desired_rows(min_rows)
                         .layouter(&mut layouter)
                         .show(ui);
 
@@ -2184,8 +2226,14 @@ impl CodeLookApp {
 
                     let rows = out.galley.rows.len().max(1);
                     let row_h = out.galley.size().y / rows as f32;
-                    let band_w = out.galley.size().x.max(ui.available_width());
                     let band_left = g_rect.left() - 8.0;
+                    // Full-width band: reach the visible pane edge (clip rect)
+                    // even when the code is narrower — IntelliJ paints the
+                    // caret line across the whole editor, not just the text.
+                    let band_right = ui
+                        .clip_rect()
+                        .right()
+                        .max(out.galley_pos.x + out.galley.size().x + 16.0);
 
                     // Active (caret) line band — gives the editor a live feel.
                     // Painted over the text, so keep it translucent (text shows through).
@@ -2193,9 +2241,9 @@ impl CodeLookApp {
                         let row = cur.primary.rcursor.row;
                         let y = out.galley_pos.y + row_h * row as f32;
                         ui.painter().rect_filled(
-                            Rect::from_min_size(
+                            Rect::from_min_max(
                                 egui::pos2(band_left, y),
-                                Vec2::new(band_w + 16.0, row_h),
+                                egui::pos2(band_right, y + row_h),
                             ),
                             0.0,
                             Color32::from_rgba_unmultiplied(0x6a, 0x72, 0x8a, 30),
@@ -2205,12 +2253,11 @@ impl CodeLookApp {
                     // Soft highlight of the most recently jumped-to line.
                     if let Some(line) = tab.flash_line {
                         let y = out.galley_pos.y + row_h * line as f32;
-                        let rect = Rect::from_min_size(
-                            egui::pos2(band_left, y),
-                            Vec2::new(band_w + 16.0, row_h),
-                        );
                         ui.painter().rect_filled(
-                            rect,
+                            Rect::from_min_max(
+                                egui::pos2(band_left, y),
+                                egui::pos2(band_right, y + row_h),
+                            ),
                             0.0,
                             Color32::from_rgba_unmultiplied(0x3a, 0x55, 0x6e, 96),
                         );
@@ -2530,9 +2577,9 @@ const TREE_ROW_H: f32 = 24.0;
 const TREE_INDENT: f32 = 14.0;
 const TREE_PAD_L: f32 = 6.0;
 
-/// One row in the Structure panel: colored kind-badge + symbol name, indented
+/// One row in the Structure panel: IntelliJ kind icon + symbol name, indented
 /// by nesting depth. Returns true when clicked.
-fn symbol_row(ui: &mut egui::Ui, s: &DocSymbol) -> bool {
+fn symbol_row(ui: &mut egui::Ui, s: &DocSymbol, icons: &icons::IconSet) -> bool {
     let full_w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(full_w, 22.0), Sense::click());
     let painter = ui.painter();
@@ -2541,23 +2588,25 @@ fn symbol_row(ui: &mut egui::Ui, s: &DocSymbol) -> bool {
     }
 
     let base_x = rect.left() + TREE_PAD_L + s.depth as f32 * TREE_INDENT;
-    let (r, g, b) = s.kind.rgb();
-    let accent = Color32::from_rgb(r, g, b);
 
-    // Rounded square badge with the kind glyph.
-    let side = 15.0;
+    let side = 16.0;
     let badge = Rect::from_center_size(
         egui::pos2(base_x + side / 2.0, rect.center().y),
         Vec2::splat(side),
     );
-    painter.rect_filled(badge, side * 0.24, accent.gamma_multiply(0.30));
-    painter.text(
-        badge.center(),
-        egui::Align2::CENTER_CENTER,
-        s.kind.glyph(),
-        FontId::monospace(11.0),
-        accent,
-    );
+    if !icons.symbol(painter, badge, s.kind) {
+        // Fallback: colored rounded badge with the kind glyph.
+        let (r, g, b) = s.kind.rgb();
+        let accent = Color32::from_rgb(r, g, b);
+        painter.rect_filled(badge, side * 0.24, accent.gamma_multiply(0.30));
+        painter.text(
+            badge.center(),
+            egui::Align2::CENTER_CENTER,
+            s.kind.glyph(),
+            FontId::monospace(11.0),
+            accent,
+        );
+    }
 
     painter.text(
         egui::pos2(badge.right() + 7.0, rect.center().y),
@@ -2607,6 +2656,7 @@ fn show_node(
     depth: usize,
     active: Option<&Path>,
     status: &HashMap<PathBuf, crate::git::FileStatus>,
+    icons: &icons::IconSet,
     to_open: &mut Option<PathBuf>,
 ) {
     let selected = !node.is_dir && active == Some(node.path.as_path());
@@ -2646,9 +2696,9 @@ fn show_node(
 
     if node.is_dir {
         icons::draw_chevron(painter, chevron_rect, node.expanded, resp.hovered());
-        icons::draw_folder_icon(painter, icon_rect, node.expanded);
+        icons.folder(painter, icon_rect, &node.name, node.expanded);
     } else {
-        icons::draw_file_icon(painter, icon_rect, &node.name);
+        icons.file(painter, icon_rect, &node.name);
     }
 
     // Color by git status (files only); selection still forces white.
@@ -2686,7 +2736,7 @@ fn show_node(
     if node.is_dir && node.expanded {
         if let Some(children) = &mut node.children {
             for child in children.iter_mut() {
-                show_node(ui, child, depth + 1, active, status, to_open);
+                show_node(ui, child, depth + 1, active, status, icons, to_open);
             }
         }
     }

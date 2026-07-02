@@ -12,6 +12,17 @@ files and are retained here.
 - The OFL permits bundling and redistribution provided the license accompanies the fonts
   and the fonts are not sold by themselves. See the upstream `OFL.txt` for full terms.
 
+## IntelliJ (expUI) icons
+
+- Files: `assets/icons/svg/*.svg` (sources), `assets/icons/png/*.png` (pre-rasterized)
+- License: Apache License 2.0
+- Copyright: © 2000–2023 JetBrains s.r.o. and contributors
+- Source: https://github.com/JetBrains/intellij-community
+  (`platform/icons/src/expui/`, Kotlin & Python plugin icon sets)
+- A few icons without an upstream equivalent (`typescript`, `rust`, `go`, `ruby`)
+  were drawn for this project in the same style and are covered by this
+  project's MIT license.
+
 ## Darcula TextMate theme
 
 - File: `assets/darcula.tmTheme`

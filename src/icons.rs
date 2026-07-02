@@ -1,8 +1,251 @@
-//! File-type icons drawn with the egui painter (no emoji / icon font needed),
-//! plus the disclosure chevron and folder glyph. Keeps the tree looking like a
-//! real IDE instead of falling back to tofu boxes for missing glyphs.
+//! File / folder / symbol icons. The primary set is JetBrains' IntelliJ
+//! "New UI" (expUI) icons — bundled as pre-rasterized 64px PNGs (sources in
+//! `assets/icons/svg/`, Apache-2.0, see THIRD_PARTY_NOTICES.md) and painted
+//! as textures. File types without an official icon fall back to the
+//! vector-drawn badge below, so nothing ever renders as a tofu box.
 
-use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
+use std::collections::HashMap;
+
+use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, TextureHandle, Vec2};
+
+use crate::ast::SymKind;
+
+macro_rules! icon {
+    ($n:literal) => {
+        ($n, include_bytes!(concat!("../assets/icons/png/", $n, ".png")) as &[u8])
+    };
+}
+
+/// All bundled expUI icons (64×64 RGBA PNG).
+const ICONS: &[(&str, &[u8])] = &[
+    icon!("archive"),
+    icon!("c"),
+    icon!("config"),
+    icon!("cpp"),
+    icon!("csharp"),
+    icon!("css"),
+    icon!("csv"),
+    icon!("docker"),
+    icon!("editorconfig"),
+    icon!("exclude_root"),
+    icon!("folder"),
+    icon!("gitignore"),
+    icon!("go"),
+    icon!("gradle"),
+    icon!("groovy"),
+    icon!("h"),
+    icon!("html"),
+    icon!("http"),
+    icon!("java"),
+    icon!("javascript"),
+    icon!("json"),
+    icon!("jupyter"),
+    icon!("kotlin"),
+    icon!("kotlin_gradle"),
+    icon!("kotlin_script"),
+    icon!("markdown"),
+    icon!("package"),
+    icon!("patch"),
+    icon!("perl"),
+    icon!("properties"),
+    icon!("python"),
+    icon!("resources_root"),
+    icon!("rst"),
+    icon!("ruby"),
+    icon!("rust"),
+    icon!("shell"),
+    icon!("source_root"),
+    icon!("sql"),
+    icon!("swift"),
+    icon!("sym_annotation"),
+    icon!("sym_class"),
+    icon!("sym_class_abstract"),
+    icon!("sym_constant"),
+    icon!("sym_constructor"),
+    icon!("sym_enum"),
+    icon!("sym_field"),
+    icon!("sym_function"),
+    icon!("sym_interface"),
+    icon!("sym_lambda"),
+    icon!("sym_method"),
+    icon!("sym_method_abstract"),
+    icon!("sym_parameter"),
+    icon!("sym_property"),
+    icon!("sym_record"),
+    icon!("sym_type"),
+    icon!("sym_variable"),
+    icon!("terraform"),
+    icon!("test_resources_root"),
+    icon!("test_root"),
+    icon!("text"),
+    icon!("toml"),
+    icon!("typescript"),
+    icon!("unknown"),
+    icon!("vue"),
+    icon!("xml"),
+    icon!("yaml"),
+];
+
+fn decode_png(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let decoder = png::Decoder::new(bytes);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    let size = [info.width as usize, info.height as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        &buf[..info.buffer_size()],
+    ))
+}
+
+/// GPU-resident icon textures, loaded once at startup.
+pub struct IconSet {
+    map: HashMap<&'static str, TextureHandle>,
+}
+
+impl IconSet {
+    pub fn new(ctx: &egui::Context) -> Self {
+        let mut map = HashMap::with_capacity(ICONS.len());
+        for (name, bytes) in ICONS {
+            if let Some(img) = decode_png(bytes) {
+                let tex = ctx.load_texture(format!("icon:{name}"), img, egui::TextureOptions::LINEAR);
+                map.insert(*name, tex);
+            }
+        }
+        Self { map }
+    }
+
+    fn paint(&self, p: &egui::Painter, rect: Rect, key: &str) -> bool {
+        let Some(tex) = self.map.get(key) else {
+            return false;
+        };
+        let side = rect.height().min(rect.width()).min(16.0);
+        let sq = Rect::from_center_size(rect.center(), Vec2::splat(side));
+        p.image(
+            tex.id(),
+            sq,
+            Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        true
+    }
+
+    /// File-type icon by file name; vector badge fallback for unmapped types.
+    pub fn file(&self, p: &egui::Painter, rect: Rect, name: &str) {
+        if !self.paint(p, rect, file_icon_key(name)) {
+            draw_file_icon(p, rect, name);
+        }
+    }
+
+    /// Folder icon by directory name (source/test/resources/excluded roots
+    /// get their IntelliJ variants).
+    pub fn folder(&self, p: &egui::Painter, rect: Rect, name: &str, expanded: bool) {
+        if !self.paint(p, rect, folder_icon_key(name)) {
+            draw_folder_icon(p, rect, expanded);
+        }
+    }
+
+    /// Structure-panel symbol icon; returns false when the caller should
+    /// fall back to the badge.
+    pub fn symbol(&self, p: &egui::Painter, rect: Rect, kind: SymKind) -> bool {
+        self.paint(p, rect, symbol_icon_key(kind))
+    }
+}
+
+/// expUI icon key for a file name (special names first, then extension).
+fn file_icon_key(name: &str) -> &'static str {
+    let lower = name.to_lowercase();
+    if lower == "dockerfile" || lower.starts_with("dockerfile.") || lower.starts_with("docker-compose") {
+        return "docker";
+    }
+    if lower == ".gitignore" || lower == ".gitattributes" || lower == ".gitmodules" {
+        return "gitignore";
+    }
+    if lower.ends_with(".gradle.kts") {
+        return "kotlin_gradle";
+    }
+    if lower.ends_with(".gradle") || lower == "gradlew" || lower == "gradlew.bat" {
+        return "gradle";
+    }
+    if lower == ".editorconfig" {
+        return "editorconfig";
+    }
+    if lower == "license" || lower.starts_with("license.") || lower == "notice" {
+        return "text";
+    }
+    match lower.rsplit('.').next().unwrap_or("") {
+        "rs" => "rust",
+        "kt" => "kotlin",
+        "kts" => "kotlin_script",
+        "java" => "java",
+        "py" | "pyi" => "python",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
+        "ts" | "tsx" | "mts" | "cts" => "typescript",
+        "go" => "go",
+        "rb" | "rake" | "gemspec" => "ruby",
+        "c" => "c",
+        "h" => "h",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "cpp",
+        "cs" => "csharp",
+        "swift" => "swift",
+        "pl" | "pm" => "perl",
+        "groovy" => "groovy",
+        "sh" | "bash" | "zsh" | "fish" => "shell",
+        "json" | "jsonc" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "properties" => "properties",
+        "ini" | "cfg" | "conf" => "config",
+        "xml" | "xsd" | "wsdl" | "plist" | "svg" => "xml",
+        "html" | "htm" | "xhtml" | "jsp" => "html",
+        "css" | "scss" | "sass" | "less" => "css",
+        "md" | "markdown" => "markdown",
+        "sql" => "sql",
+        "csv" | "tsv" => "csv",
+        "tf" | "tfvars" => "terraform",
+        "http" | "rest" => "http",
+        "ipynb" => "jupyter",
+        "rst" => "rst",
+        "patch" | "diff" => "patch",
+        "vue" => "vue",
+        "zip" | "tar" | "gz" | "tgz" | "jar" | "war" | "7z" | "rar" => "archive",
+        "txt" | "log" | "lock" | "text" => "text",
+        _ => "text",
+    }
+}
+
+/// expUI folder icon key by directory name (IntelliJ root-type heuristics).
+fn folder_icon_key(name: &str) -> &'static str {
+    match name {
+        "src" => "source_root",
+        "test" | "tests" | "__tests__" | "testFixtures" | "androidTest" => "test_root",
+        "resources" | "res" => "resources_root",
+        "testResources" => "test_resources_root",
+        "build" | "target" | "dist" | "out" | "node_modules" | ".gradle" | ".idea" => {
+            "exclude_root"
+        }
+        _ => "folder",
+    }
+}
+
+/// expUI node icon key for a structure symbol kind.
+fn symbol_icon_key(kind: SymKind) -> &'static str {
+    match kind {
+        SymKind::Function => "sym_function",
+        SymKind::Method => "sym_method",
+        SymKind::Class | SymKind::Object => "sym_class",
+        SymKind::Struct => "sym_record",
+        SymKind::Enum => "sym_enum",
+        SymKind::Trait | SymKind::Interface => "sym_interface",
+        SymKind::Module => "package",
+        SymKind::Const => "sym_constant",
+        SymKind::Type => "sym_type",
+        SymKind::Macro => "sym_lambda",
+    }
+}
 
 /// Accent color for a file name based on its extension (tree dot / tab marker).
 pub fn file_accent(name: &str) -> Color32 {

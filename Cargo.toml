@@ -26,12 +26,12 @@ tree-sitter-kotlin-ng = "1.1.0"
 tree-sitter-json = "0.24.8"
 tree-sitter-highlight = "0.26.9"
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
-png = { version = "0.17", optional = true }
+png = "0.17"
 
 [features]
 # Build with `--features shot` to enable `--shot <out.png>` capture mode
 # (used by the design-review loop). Excluded from the default/release build.
-shot = ["dep:png"]
+shot = []
 
 [profile.release]
 opt-level = 3

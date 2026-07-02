@@ -8,9 +8,9 @@ Built for quickly *reading* and *reviewing* a codebase — not editing it.
 ## Features
 
 - **IntelliJ New UI dark** look — JetBrains Mono for code, tonal panel/editor separation, tool‑window headers.
-- **Project tree** with real file‑type icon badges, indent guides, and full‑width selection.
+- **Project tree** with the official IntelliJ (expUI) file/folder icons — source/test/resources root variants, special names (Dockerfile, .gitignore, build.gradle.kts, …) — plus indent guides and full‑width selection.
 - **Syntax highlighting** via tree‑sitter (Rust, Kotlin, Java, Python, Go, JS/TS) with a syntect/Darcula fallback for everything else.
-- **Structure panel** — AST‑derived symbol outline of the current file (click to jump).
+- **Structure panel** — AST‑derived symbol outline with IntelliJ kind icons (class/method/field/…), click to jump.
 - **⌘+Click go‑to‑definition** backed by a background‑built symbol index.
 - **In‑file search** (⌘F) and **project‑wide search / Find in Files** (⇧⌘F) with live results, a code preview pane, and match highlighting.
 - **Back / Forward navigation** (⌘[ / ⌘] or ⌥⌘← / ⌥⌘→, and mouse side buttons).
@@ -59,7 +59,7 @@ All other file types fall back to syntect's TextMate grammars.
 
 ## Credits / third‑party
 
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Bundles **JetBrains Mono** (SIL OFL 1.1) and the **Darcula** TextMate theme.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Bundles **JetBrains Mono** (SIL OFL 1.1), the **IntelliJ expUI icons** (Apache‑2.0), and the **Darcula** TextMate theme.
 
 ## License
 

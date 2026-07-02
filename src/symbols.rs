@@ -17,6 +17,22 @@ pub type SymbolIndex = HashMap<String, Vec<SymbolLoc>>;
 
 const MAX_FILE_BYTES: u64 = 2_000_000;
 
+/// Extensions the regex fallback may index. Code only — prose/config files
+/// (markdown, yaml, …) often quote code snippets, and indexing those made
+/// ⌘+Click jump from real code into documentation.
+const CODE_EXTS: &[&str] = &[
+    "rs", "kt", "kts", "java", "py", "pyi", "js", "jsx", "mjs", "cjs", "ts", "tsx", "go", "rb",
+    "c", "h", "cpp", "cc", "cxx", "hpp", "cs", "swift", "php", "scala", "groovy", "sh", "bash",
+    "zsh", "pl", "lua", "sql", "gradle",
+];
+
+fn is_code_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| CODE_EXTS.iter().any(|c| e.eq_ignore_ascii_case(c)))
+        .unwrap_or(false)
+}
+
 fn definition_patterns() -> Vec<Regex> {
     // Capture group 1 is always the symbol name. These are heuristics applied
     // across all languages — good enough to jump to a definition.
@@ -52,6 +68,12 @@ pub fn build_index(root: &Path) -> SymbolIndex {
             continue;
         }
         let path = entry.path();
+        // Only source files enter the index (AST languages, or the regex
+        // fallback's code-extension whitelist) — never docs/config.
+        let lang = crate::ast::Lang::from_path(path);
+        if lang.is_none() && !is_code_file(path) {
+            continue;
+        }
         if path.metadata().map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(true) {
             continue;
         }
@@ -61,12 +83,33 @@ pub fn build_index(root: &Path) -> SymbolIndex {
         };
         // Prefer AST-based extraction; fall back to regex for languages without
         // a tree-sitter grammar wired up.
-        match crate::ast::Lang::from_path(path) {
+        match lang {
             Some(lang) => crate::ast::index_file(lang, path, &content, &mut index),
             None => scan(path, &content, &patterns, &mut index),
         }
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docs_are_not_indexed() {
+        let dir = std::env::temp_dir().join(format!("codelook_sym_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("real.kt"), "class FooBarBaz {}\n").unwrap();
+        std::fs::write(
+            dir.join("doc.md"),
+            "예시:\n```kotlin\nclass FooBarBaz {}\n```\n",
+        )
+        .unwrap();
+        let index = build_index(&dir);
+        let locs = index.get("FooBarBaz").expect("kt definition indexed");
+        assert!(locs.iter().all(|l| l.path.extension().unwrap() == "kt"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 fn scan(path: &Path, content: &str, patterns: &[Regex], index: &mut SymbolIndex) {
