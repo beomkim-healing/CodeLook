@@ -697,6 +697,7 @@ dependencies = [
  "egui",
  "git2",
  "ignore",
+ "memchr",
  "png 0.17.16",
  "regex",
  "rfd",

@@ -165,14 +165,17 @@ pub struct CodeLookApp {
     gsearch_open: bool,
     gsearch_query: String,
     gsearch_results: Vec<crate::search::SearchHit>,
+    gsearch_files: usize, // distinct files in gsearch_results (precomputed)
     gsearch_truncated: bool,
     gsearch_sel: usize,
     gsearch_focus: bool,
     gsearch_running: bool,
     gsearch_dirty_at: Option<f64>,
-    gsearch_last: String,
     gsearch_prev: String,
-    gsearch_rx: Option<Receiver<(String, Vec<crate::search::SearchHit>, bool)>>,
+    // Persistent background worker owning the searchable-file snapshot.
+    gsearch_worker: Option<crate::search::Worker>,
+    gsearch_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    gsearch_rx: Option<Receiver<crate::search::Reply>>,
     // Preview pane for the selected search hit.
     gpreview_path: Option<PathBuf>,
     gpreview_job: LayoutJob,
@@ -241,13 +244,15 @@ impl CodeLookApp {
             gsearch_open: false,
             gsearch_query: String::new(),
             gsearch_results: Vec::new(),
+            gsearch_files: 0,
             gsearch_truncated: false,
             gsearch_sel: 0,
             gsearch_focus: false,
             gsearch_running: false,
             gsearch_dirty_at: None,
-            gsearch_last: String::new(),
             gsearch_prev: String::new(),
+            gsearch_worker: None,
+            gsearch_cancel: None,
             gsearch_rx: None,
             gpreview_path: None,
             gpreview_job: LayoutJob::default(),
@@ -310,10 +315,10 @@ impl CodeLookApp {
             // Populate the global-search popup synchronously for the screenshot.
             if let (Some(q), Some(root)) = (&s.gsearch, app.project_root.clone()) {
                 let (hits, tr) = crate::search::global_search(&root, q);
+                app.gsearch_files = count_hit_files(&hits);
                 app.gsearch_results = hits;
                 app.gsearch_truncated = tr;
                 app.gsearch_query = q.clone();
-                app.gsearch_last = q.clone();
                 app.gsearch_open = true;
             }
             return app;
@@ -347,6 +352,21 @@ impl CodeLookApp {
         self.index_rx = Some(rx);
         self.indexing = true;
         self.status = "프로젝트 인덱싱 중…".to_string();
+
+        // Drop the search worker (its snapshot belongs to the old root) and
+        // any in-flight query.
+        if let Some(c) = &self.gsearch_cancel {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.gsearch_worker = None;
+        self.gsearch_cancel = None;
+        self.gsearch_rx = None;
+        self.gsearch_results.clear();
+        self.gsearch_files = 0;
+        self.gsearch_truncated = false;
+        self.gsearch_running = false;
+        self.gsearch_sel = 0;
+        self.gsearch_open = false;
 
         // Reset commit-log / diff state for the new project.
         self.commits.clear();
@@ -470,44 +490,68 @@ impl CodeLookApp {
 
     // ---- Project-wide search ("Find in Files") -----------------------------
 
-    /// Spawn a background scan for the current query (min 2 chars).
-    fn gsearch_kick(&mut self, ctx: &egui::Context) {
+    /// Create the persistent search worker for the current project root.
+    fn ensure_gsearch_worker(&mut self, ctx: &egui::Context) {
+        if self.gsearch_worker.is_some() {
+            return;
+        }
         let root = match &self.project_root {
             Some(r) => r.clone(),
             None => return,
         };
-        let query = self.gsearch_query.clone();
-        self.gsearch_last = query.clone();
-        if query.trim().len() < 2 {
-            self.gsearch_results.clear();
-            self.gsearch_truncated = false;
-            self.gsearch_running = false;
-            self.gsearch_rx = None;
-            return;
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
         let ctx2 = ctx.clone();
-        std::thread::spawn(move || {
-            let (hits, truncated) = crate::search::global_search(&root, &query);
-            let _ = tx.send((query, hits, truncated));
-            ctx2.request_repaint();
-        });
+        let (worker, rx) = crate::search::Worker::new(root, move || ctx2.request_repaint());
+        self.gsearch_worker = Some(worker);
         self.gsearch_rx = Some(rx);
-        self.gsearch_running = true;
     }
 
-    /// Accept background results if they match the current query (drop stale).
+    /// Pre-build the file snapshot (called when the search popup opens), so
+    /// the first real query only pays the scan, not the initial disk walk.
+    fn gsearch_warm(&mut self, ctx: &egui::Context) {
+        self.ensure_gsearch_worker(ctx);
+        if let (Some(w), None) = (&self.gsearch_worker, &self.gsearch_cancel) {
+            self.gsearch_cancel = Some(w.submit(String::new()));
+        }
+    }
+
+    /// Queue the current query on the worker (min 2 chars), cancelling the
+    /// previous one.
+    fn gsearch_kick(&mut self, ctx: &egui::Context) {
+        if let Some(c) = &self.gsearch_cancel {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.gsearch_cancel = None;
+        }
+        let query = self.gsearch_query.clone();
+        if query.trim().len() < 2 {
+            self.gsearch_results.clear();
+            self.gsearch_files = 0;
+            self.gsearch_truncated = false;
+            self.gsearch_running = false;
+            return;
+        }
+        self.ensure_gsearch_worker(ctx);
+        if let Some(w) = &self.gsearch_worker {
+            self.gsearch_cancel = Some(w.submit(query));
+            self.gsearch_running = true;
+        }
+    }
+
+    /// Accept background results matching the current query (drop stale).
     fn gsearch_poll(&mut self) {
+        let mut accepted = None;
         if let Some(rx) = &self.gsearch_rx {
-            if let Ok((q, hits, truncated)) = rx.try_recv() {
-                if q == self.gsearch_query {
-                    self.gsearch_results = hits;
-                    self.gsearch_truncated = truncated;
-                    self.gsearch_sel = 0;
-                    self.gsearch_running = false;
-                    self.gsearch_rx = None;
+            while let Ok(reply) = rx.try_recv() {
+                if reply.0 == self.gsearch_query {
+                    accepted = Some(reply);
                 }
             }
+        }
+        if let Some((_, hits, truncated)) = accepted {
+            self.gsearch_files = count_hit_files(&hits);
+            self.gsearch_results = hits;
+            self.gsearch_truncated = truncated;
+            self.gsearch_sel = 0;
+            self.gsearch_running = false;
         }
     }
 
@@ -570,35 +614,25 @@ impl CodeLookApp {
         }
 
         // (Re)compute match markers when the file or the query term changes.
-        let needle = self.gsearch_query.to_lowercase();
+        // Matching is ASCII-case-insensitive (crate::search), so byte offsets
+        // are exact and a match's char length equals the query's.
+        let needle = self.gsearch_query.clone();
         if path_changed || needle != self.gpreview_needle {
-            self.gpreview_needle = needle.clone();
-            let content = std::mem::take(&mut self.gpreview_content);
             let mut marks = Vec::new();
-            // Char-length of the match; assume it equals the needle's (true for
-            // ASCII / typical code — case folding rarely changes char count).
             let len_char = needle.chars().count();
             if !needle.is_empty() {
-                let lower = content.to_lowercase();
-                // Only reliable when lowercasing preserves byte offsets (ASCII).
-                // Fall back to skipping marks if a length shift is detected.
-                if lower.len() == content.len() {
-                    let mut search_from = 0;
-                    let mut prev_byte = 0usize;
-                    let mut char_idx = 0usize;
-                    while let Some(rel) = lower[search_from..].find(&needle) {
-                        let bpos = search_from + rel;
-                        char_idx += content[prev_byte..bpos].chars().count();
-                        prev_byte = bpos;
-                        marks.push((char_idx, len_char));
-                        search_from = bpos + needle.len();
-                        if marks.len() >= 4000 {
-                            break;
-                        }
-                    }
+                let content = &self.gpreview_content;
+                let mut prev_byte = 0usize;
+                let mut char_idx = 0usize;
+                for bpos in
+                    crate::search::find_all_ci(content.as_bytes(), needle.as_bytes(), 4000)
+                {
+                    char_idx += content[prev_byte..bpos].chars().count();
+                    prev_byte = bpos;
+                    marks.push((char_idx, len_char));
                 }
             }
-            self.gpreview_content = content;
+            self.gpreview_needle = needle;
             self.gpreview_marks = marks;
         }
     }
@@ -851,6 +885,7 @@ impl eframe::App for CodeLookApp {
         if open_gfind && self.project_root.is_some() {
             self.gsearch_open = true;
             self.gsearch_focus = true;
+            self.gsearch_warm(ctx);
         }
         if esc {
             self.search_open = false;
@@ -941,6 +976,7 @@ impl CodeLookApp {
                     {
                         self.gsearch_open = true;
                         self.gsearch_focus = true;
+                        self.gsearch_warm(ctx);
                     }
 
                     ui.add_space(4.0);
@@ -1215,7 +1251,7 @@ impl CodeLookApp {
         let preview_job = std::mem::take(&mut self.gpreview_job);
         let preview_gutter = std::mem::take(&mut self.gpreview_gutter);
         let preview_marks = std::mem::take(&mut self.gpreview_marks);
-        let needle = query.to_lowercase();
+        let needle = query.clone(); // markers match ASCII-case-insensitively
         let needle_len_char = needle.chars().count();
         let focus_ci = self.gpreview_focus_ci;
         let mut sel = self.gsearch_sel;
@@ -1233,17 +1269,9 @@ impl CodeLookApp {
         } else if results.is_empty() {
             "결과 없음".to_string()
         } else {
-            let mut files = 0;
-            let mut prev: Option<&Path> = None;
-            for h in &results {
-                if prev != Some(h.path.as_path()) {
-                    files += 1;
-                    prev = Some(h.path.as_path());
-                }
-            }
             format!(
                 "{}개 파일에서 {}건{}",
-                files,
+                self.gsearch_files,
                 results.len(),
                 if truncated { " (상한 도달)" } else { "" }
             )
@@ -1289,72 +1317,79 @@ impl CodeLookApp {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         let row_font = FontId::monospace(12.5);
                         let text_x = 42.0;
-                        let mut prev: Option<PathBuf> = None;
+                        let mut prev: Option<&Path> = None;
                         for (idx, hit) in results.iter().enumerate() {
-                            if prev.as_deref() != Some(hit.path.as_path()) {
-                                prev = Some(hit.path.clone());
-                                let rel = hit
-                                    .path
-                                    .strip_prefix(&root)
-                                    .unwrap_or(&hit.path)
-                                    .to_string_lossy()
-                                    .to_string();
-                                let name = hit
-                                    .path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_default();
+                            if prev != Some(hit.path.as_path()) {
+                                prev = Some(hit.path.as_path());
                                 ui.add_space(6.0);
                                 let full = ui.available_width();
                                 let (hr, _) =
                                     ui.allocate_exact_size(Vec2::new(full, 22.0), Sense::hover());
-                                let p = ui.painter();
-                                let badge = Rect::from_center_size(
-                                    egui::pos2(hr.left() + 9.0, hr.center().y),
-                                    Vec2::splat(14.0),
-                                );
-                                icons::draw_file_icon(p, badge, &name);
-                                p.text(
-                                    egui::pos2(badge.right() + 6.0, hr.center().y),
-                                    Align2::LEFT_CENTER,
-                                    rel,
-                                    FontId::proportional(12.5),
-                                    C_HEADER,
-                                );
+                                // Rows keep their slot in the layout, but text/
+                                // icon work only happens for visible ones.
+                                if ui.is_rect_visible(hr) {
+                                    let rel = hit
+                                        .path
+                                        .strip_prefix(&root)
+                                        .unwrap_or(&hit.path)
+                                        .to_string_lossy()
+                                        .to_string();
+                                    let name = hit
+                                        .path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    let p = ui.painter();
+                                    let badge = Rect::from_center_size(
+                                        egui::pos2(hr.left() + 9.0, hr.center().y),
+                                        Vec2::splat(14.0),
+                                    );
+                                    icons::draw_file_icon(p, badge, &name);
+                                    p.text(
+                                        egui::pos2(badge.right() + 6.0, hr.center().y),
+                                        Align2::LEFT_CENTER,
+                                        rel,
+                                        FontId::proportional(12.5),
+                                        C_HEADER,
+                                    );
+                                }
                             }
 
                             let full = ui.available_width();
                             let (rr, rresp) =
                                 ui.allocate_exact_size(Vec2::new(full, 22.0), Sense::click());
-                            let p = ui.painter();
-                            if idx == sel {
-                                p.rect_filled(rr, 0.0, C_SEL);
-                            } else if rresp.hovered() {
-                                p.rect_filled(rr, 0.0, C_HOVER);
-                            }
-                            p.text(
-                                egui::pos2(rr.left() + 30.0, rr.center().y),
-                                Align2::RIGHT_CENTER,
-                                (hit.line + 1).to_string(),
-                                FontId::monospace(11.5),
-                                C_TEXT_DIM,
-                            );
-                            let text: String = hit.text.trim_start().chars().take(300).collect();
-                            p.text(
-                                egui::pos2(rr.left() + text_x, rr.center().y),
-                                Align2::LEFT_CENTER,
-                                &text,
-                                FontId::monospace(12.5),
-                                if idx == sel { Color32::WHITE } else { C_TEXT },
-                            );
-                            // Highlighter marker over each occurrence of the term,
-                            // positioned by measuring real text width (tab-safe).
-                            if !needle.is_empty() {
-                                let lower = text.to_lowercase();
-                                if lower.len() == text.len() {
-                                    let mut start = 0;
-                                    while let Some(rel) = lower[start..].find(&needle) {
-                                        let bpos = start + rel;
+                            if ui.is_rect_visible(rr) {
+                                let p = ui.painter();
+                                if idx == sel {
+                                    p.rect_filled(rr, 0.0, C_SEL);
+                                } else if rresp.hovered() {
+                                    p.rect_filled(rr, 0.0, C_HOVER);
+                                }
+                                p.text(
+                                    egui::pos2(rr.left() + 30.0, rr.center().y),
+                                    Align2::RIGHT_CENTER,
+                                    (hit.line + 1).to_string(),
+                                    FontId::monospace(11.5),
+                                    C_TEXT_DIM,
+                                );
+                                let text: String =
+                                    hit.text.trim_start().chars().take(300).collect();
+                                p.text(
+                                    egui::pos2(rr.left() + text_x, rr.center().y),
+                                    Align2::LEFT_CENTER,
+                                    &text,
+                                    FontId::monospace(12.5),
+                                    if idx == sel { Color32::WHITE } else { C_TEXT },
+                                );
+                                // Highlighter marker over each occurrence of the
+                                // term (ASCII-case-insensitive), positioned by
+                                // measuring real text width (tab-safe).
+                                if !needle.is_empty() {
+                                    for bpos in crate::search::find_all_ci(
+                                        text.as_bytes(),
+                                        needle.as_bytes(),
+                                        32,
+                                    ) {
                                         let px = ui.fonts(|f| {
                                             f.layout_no_wrap(
                                                 text[..bpos].to_string(),
@@ -1383,7 +1418,6 @@ impl CodeLookApp {
                                             2.0,
                                             Color32::from_rgba_unmultiplied(0xe6, 0xb0, 0x3a, 72),
                                         );
-                                        start = bpos + needle.len();
                                     }
                                 }
                             }
@@ -2230,6 +2264,20 @@ impl CodeLookApp {
             self.goto_definition(&w);
         }
     }
+}
+
+/// Number of distinct files in a (path-grouped) hit list — shown in the
+/// search status line, computed once per result set instead of per frame.
+fn count_hit_files(hits: &[crate::search::SearchHit]) -> usize {
+    let mut files = 0;
+    let mut prev: Option<&Path> = None;
+    for h in hits {
+        if prev != Some(h.path.as_path()) {
+            files += 1;
+            prev = Some(h.path.as_path());
+        }
+    }
+    files
 }
 
 /// Whole-text char index of a (line, byte-column) position — used to focus the
