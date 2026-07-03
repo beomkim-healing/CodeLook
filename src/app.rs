@@ -139,18 +139,127 @@ struct DiffView {
     commit_short: String,
     file: String,
     lines: Vec<crate::git::DiffLine>,
+    /// Per-line syntax-highlighted jobs (None for hunk headers). Built from
+    /// the reconstructed old/new documents so multi-line constructs keep
+    /// their colors inside a hunk.
+    jobs: Vec<Option<LayoutJob>>,
+    /// Font size the jobs were built at (rebuilt on zoom).
+    jobs_font: f32,
 }
 
-pub struct CodeLookApp {
+/// Reconstruct the old/new documents from a unified diff, highlight each once
+/// with the file's real grammar, and hand every diff row its slice: deleted
+/// rows read from the old document, added/context rows from the new one.
+fn build_diff_jobs(
+    hl: &Highlighter,
+    file: &str,
+    lines: &[crate::git::DiffLine],
+    font_size: f32,
+) -> Vec<Option<LayoutJob>> {
+    use crate::git::DiffKind::*;
+    let mut old_doc = String::new();
+    let mut new_doc = String::new();
+    // For each diff row: which side it reads from and its line index there.
+    let mut source: Vec<Option<(bool, usize)>> = Vec::with_capacity(lines.len()); // (is_old, line)
+    let (mut old_n, mut new_n) = (0usize, 0usize);
+    for dl in lines {
+        match dl.kind {
+            Del => {
+                old_doc.push_str(&dl.text);
+                old_doc.push('\n');
+                source.push(Some((true, old_n)));
+                old_n += 1;
+            }
+            Add => {
+                new_doc.push_str(&dl.text);
+                new_doc.push('\n');
+                source.push(Some((false, new_n)));
+                new_n += 1;
+            }
+            Context => {
+                old_doc.push_str(&dl.text);
+                old_doc.push('\n');
+                old_n += 1;
+                new_doc.push_str(&dl.text);
+                new_doc.push('\n');
+                source.push(Some((false, new_n)));
+                new_n += 1;
+            }
+            Hunk => source.push(None),
+        }
+    }
+    let old_jobs = split_job_lines(&old_doc, &hl.highlight(file, &old_doc, font_size));
+    let new_jobs = split_job_lines(&new_doc, &hl.highlight(file, &new_doc, font_size));
+    source
+        .into_iter()
+        .map(|s| {
+            s.and_then(|(is_old, n)| {
+                if is_old {
+                    old_jobs.get(n).cloned()
+                } else {
+                    new_jobs.get(n).cloned()
+                }
+            })
+        })
+        .collect()
+}
+
+/// Split a whole-document LayoutJob into one single-line job per line, with
+/// section byte ranges clipped and rebased. Sections are assumed sorted by
+/// start (true for the highlighter's output).
+fn split_job_lines(doc: &str, job: &LayoutJob) -> Vec<LayoutJob> {
+    let bytes = doc.as_bytes();
+    let mut out = Vec::new();
+    let mut ls = 0usize;
+    let mut si = 0usize; // first section that may overlap the current line
+    for i in 0..=bytes.len() {
+        if i == bytes.len() || bytes[i] == b'\n' {
+            if i == bytes.len() && ls > i {
+                break; // trailing newline already consumed
+            }
+            let le = i;
+            let mut lj = LayoutJob {
+                text: doc[ls..le].to_string(),
+                ..Default::default()
+            };
+            lj.wrap.max_width = f32::INFINITY;
+            while si < job.sections.len() && job.sections[si].byte_range.end <= ls {
+                si += 1;
+            }
+            let mut j = si;
+            while j < job.sections.len() && job.sections[j].byte_range.start < le {
+                let a = job.sections[j].byte_range.start.max(ls);
+                let b = job.sections[j].byte_range.end.min(le);
+                if a < b {
+                    lj.sections.push(egui::text::LayoutSection {
+                        leading_space: 0.0,
+                        byte_range: (a - ls)..(b - ls),
+                        format: job.sections[j].format.clone(),
+                    });
+                }
+                j += 1;
+            }
+            out.push(lj);
+            ls = i + 1;
+        }
+    }
+    out
+}
+
+/// Everything that belongs to ONE opened project — its tree, open file tabs,
+/// git state, search state, symbol index, navigation history. The app keeps
+/// the active workspace in `CodeLookApp::ws` and parks the rest, so several
+/// projects can be open at once and switched via the project tab strip.
+pub struct Workspace {
+    /// Open order — project tabs display sorted by this.
+    seq: usize,
     project_root: Option<PathBuf>,
     tree: Option<TreeNode>,
     tabs: Vec<Tab>,
     active: Option<usize>,
-    highlighter: Highlighter,
     symbol_index: Option<SymbolIndex>,
     index_rx: Option<Receiver<SymbolIndex>>,
     indexing: bool,
-    font_size: f32,
     status: String,
     // In-file search.
     search_open: bool,
@@ -192,9 +301,6 @@ pub struct CodeLookApp {
     git_branch: Option<String>,
     #[allow(clippy::type_complexity)]
     git_rx: Option<Receiver<(HashMap<PathBuf, crate::git::FileStatus>, Option<String>)>>,
-    // Tool-window visibility toggles.
-    tree_open: bool,
-    structure_open: bool,
     // Commit Log panel + diff viewer.
     log_open: bool,
     /// Commit-list / file-list split as a fraction of the panel width.
@@ -205,38 +311,19 @@ pub struct CodeLookApp {
     commit_files: Vec<crate::git::FileChange>,
     commit_files_for: String,
     diff_view: Option<DiffView>,
-    // IntelliJ expUI icon textures (files / folders / structure symbols).
-    icons: icons::IconSet,
-    // Capture mode (design-review loop); None in normal use.
-    shot: Option<crate::ShotConfig>,
-    shot_frame: u32,
 }
 
-impl CodeLookApp {
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
-        initial: Option<PathBuf>,
-        shot: Option<crate::ShotConfig>,
-    ) -> Self {
-        setup_fonts(&cc.egui_ctx);
-        apply_theme(&cc.egui_ctx);
-
-        let restored = cc
-            .storage
-            .and_then(|s| s.get_string("last_project"))
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir());
-
-        let mut app = Self {
+impl Workspace {
+    fn new(seq: usize) -> Self {
+        Self {
+            seq,
             project_root: None,
             tree: None,
             tabs: Vec::new(),
             active: None,
-            highlighter: Highlighter::new(),
             symbol_index: None,
             index_rx: None,
             indexing: false,
-            font_size: 14.0,
             status: String::new(),
             search_open: false,
             search_query: String::new(),
@@ -271,8 +358,6 @@ impl CodeLookApp {
             git_status: HashMap::new(),
             git_branch: None,
             git_rx: None,
-            tree_open: true,
-            structure_open: true,
             log_open: false,
             log_split: 0.6,
             commits: Vec::new(),
@@ -281,6 +366,63 @@ impl CodeLookApp {
             commit_files: Vec::new(),
             commit_files_for: String::new(),
             diff_view: None,
+        }
+    }
+
+    /// Stop this workspace's in-flight background search (called on close).
+    fn cancel_background(&self) {
+        if let Some(c) = &self.gsearch_cancel {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+pub struct CodeLookApp {
+    /// The active project.
+    ws: Workspace,
+    /// Other open projects (order irrelevant — tabs sort by `seq`).
+    parked: Vec<Workspace>,
+    next_seq: usize,
+    highlighter: Highlighter,
+    font_size: f32,
+    // Tool-window visibility toggles.
+    tree_open: bool,
+    structure_open: bool,
+    // IntelliJ expUI icon textures (files / folders / structure symbols).
+    icons: icons::IconSet,
+    // Capture mode (design-review loop); None in normal use.
+    shot: Option<crate::ShotConfig>,
+    shot_frame: u32,
+}
+
+impl CodeLookApp {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        initial: Option<PathBuf>,
+        shot: Option<crate::ShotConfig>,
+    ) -> Self {
+        setup_fonts(&cc.egui_ctx);
+        apply_theme(&cc.egui_ctx);
+
+        let restored = cc
+            .storage
+            .and_then(|s| s.get_string("last_project"))
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir());
+        let restored_all: Vec<PathBuf> = cc
+            .storage
+            .and_then(|s| s.get_string("open_projects"))
+            .map(|s| s.lines().map(PathBuf::from).filter(|p| p.is_dir()).collect())
+            .unwrap_or_default();
+
+        let mut app = Self {
+            ws: Workspace::new(0),
+            parked: Vec::new(),
+            next_seq: 1,
+            highlighter: Highlighter::new(),
+            font_size: 14.0,
+            tree_open: true,
+            structure_open: true,
             icons: icons::IconSet::new(&cc.egui_ctx),
             shot,
             shot_frame: 0,
@@ -304,48 +446,123 @@ impl CodeLookApp {
                 app.open_project(&cc.egui_ctx, p);
             }
             // Compute git state synchronously so the screenshot shows it.
-            if let Some(root) = app.project_root.clone() {
-                app.git_status = crate::git::status_map(&root);
-                app.git_branch = crate::git::current_branch(&root);
+            if let Some(root) = app.ws.project_root.clone() {
+                app.ws.git_status = crate::git::status_map(&root);
+                app.ws.git_branch = crate::git::current_branch(&root);
                 if s.log {
-                    app.log_open = true;
-                    app.commits = crate::git::commit_log(&root, 300);
-                    if !app.commits.is_empty() {
+                    app.ws.log_open = true;
+                    app.ws.commits = crate::git::commit_log(&root, 300);
+                    if !app.ws.commits.is_empty() {
                         app.select_commit(0);
-                        if let Some(f) = app.commit_files.first().cloned() {
+                        if let Some(f) = app.ws.commit_files.first().cloned() {
                             app.open_commit_diff(f.path);
                         }
                     }
                 }
             }
             // Populate the global-search popup synchronously for the screenshot.
-            if let (Some(q), Some(root)) = (&s.gsearch, app.project_root.clone()) {
+            if let (Some(q), Some(root)) = (&s.gsearch, app.ws.project_root.clone()) {
                 let (hits, tr) = crate::search::global_search(&root, q);
-                app.gsearch_files = count_hit_files(&hits);
-                app.gsearch_results = hits;
-                app.gsearch_truncated = tr;
-                app.gsearch_query = q.clone();
-                app.gsearch_open = true;
+                app.ws.gsearch_files = count_hit_files(&hits);
+                app.ws.gsearch_results = hits;
+                app.ws.gsearch_truncated = tr;
+                app.ws.gsearch_query = q.clone();
+                app.ws.gsearch_open = true;
             }
             return app;
         }
 
-        if let Some(p) = initial.or(restored) {
+        if let Some(p) = initial {
             app.open_project(&cc.egui_ctx, p);
+        } else {
+            // Restore every project that was open, then focus the last active
+            // one (open_project just switches when it's already open).
+            for p in restored_all {
+                app.open_project(&cc.egui_ctx, p);
+            }
+            if let Some(p) = restored {
+                app.open_project(&cc.egui_ctx, p);
+            }
         }
         app
     }
 
+    // ---- Multi-project workspaces -------------------------------------------
+
+    /// Bring an already-open project to the front.
+    fn switch_project(&mut self, root: &Path) {
+        if self.ws.project_root.as_deref() == Some(root) {
+            return;
+        }
+        if let Some(i) = self
+            .parked
+            .iter()
+            .position(|w| w.project_root.as_deref() == Some(root))
+        {
+            std::mem::swap(&mut self.ws, &mut self.parked[i]);
+        }
+    }
+
+    /// Close an open project tab. Closing the active one activates the most
+    /// recently opened remaining project (or leaves an empty workspace).
+    fn close_project(&mut self, root: &Path) {
+        if let Some(i) = self
+            .parked
+            .iter()
+            .position(|w| w.project_root.as_deref() == Some(root))
+        {
+            self.parked.remove(i).cancel_background();
+            return;
+        }
+        if self.ws.project_root.as_deref() == Some(root) {
+            self.ws.cancel_background();
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            let closed = std::mem::replace(&mut self.ws, Workspace::new(seq));
+            drop(closed);
+            // Activate the most recently opened remaining project.
+            if let Some((i, _)) = self
+                .parked
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, w)| w.seq)
+                .map(|(i, w)| (i, w.seq))
+            {
+                let w = self.parked.remove(i);
+                self.ws = w;
+            }
+        }
+    }
+
     fn open_project(&mut self, ctx: &egui::Context, path: PathBuf) {
         let path = path.canonicalize().unwrap_or(path);
+        // Already open → just focus its tab.
+        if self.ws.project_root.as_ref() == Some(&path) {
+            return;
+        }
+        if self
+            .parked
+            .iter()
+            .any(|w| w.project_root.as_ref() == Some(&path))
+        {
+            self.switch_project(&path);
+            return;
+        }
+        // Park the current project and load the new one into a fresh tab.
+        if self.ws.project_root.is_some() {
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            let old = std::mem::replace(&mut self.ws, Workspace::new(seq));
+            self.parked.push(old);
+        }
         let mut root = TreeNode::new(path.clone(), true);
         root.expanded = true;
         root.children = Some(load_children(&path));
-        self.tree = Some(root);
-        self.project_root = Some(path.clone());
-        self.tabs.clear();
-        self.active = None;
-        self.symbol_index = None;
+        self.ws.tree = Some(root);
+        self.ws.project_root = Some(path.clone());
+        self.ws.tabs.clear();
+        self.ws.active = None;
+        self.ws.symbol_index = None;
 
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx2 = ctx.clone();
@@ -355,36 +572,36 @@ impl CodeLookApp {
             let _ = tx.send(idx);
             ctx2.request_repaint();
         });
-        self.index_rx = Some(rx);
-        self.indexing = true;
-        self.status = "프로젝트 인덱싱 중…".to_string();
+        self.ws.index_rx = Some(rx);
+        self.ws.indexing = true;
+        self.ws.status = "프로젝트 인덱싱 중…".to_string();
 
         // Drop the search worker (its snapshot belongs to the old root) and
         // any in-flight query.
-        if let Some(c) = &self.gsearch_cancel {
+        if let Some(c) = &self.ws.gsearch_cancel {
             c.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        self.gsearch_worker = None;
-        self.gsearch_cancel = None;
-        self.gsearch_rx = None;
-        self.gsearch_results.clear();
-        self.gsearch_files = 0;
-        self.gsearch_truncated = false;
-        self.gsearch_running = false;
-        self.gsearch_sel = 0;
-        self.gsearch_open = false;
+        self.ws.gsearch_worker = None;
+        self.ws.gsearch_cancel = None;
+        self.ws.gsearch_rx = None;
+        self.ws.gsearch_results.clear();
+        self.ws.gsearch_files = 0;
+        self.ws.gsearch_truncated = false;
+        self.ws.gsearch_running = false;
+        self.ws.gsearch_sel = 0;
+        self.ws.gsearch_open = false;
 
         // Reset commit-log / diff state for the new project.
-        self.commits.clear();
-        self.commits_rx = None;
-        self.commit_files.clear();
-        self.commit_files_for.clear();
-        self.commit_sel = 0;
-        self.diff_view = None;
+        self.ws.commits.clear();
+        self.ws.commits_rx = None;
+        self.ws.commit_files.clear();
+        self.ws.commit_files_for.clear();
+        self.ws.commit_sel = 0;
+        self.ws.diff_view = None;
 
         // Git status + branch on a background thread (opens the repo in-thread).
-        self.git_status.clear();
-        self.git_branch = None;
+        self.ws.git_status.clear();
+        self.ws.git_branch = None;
         let (gtx, grx) = std::sync::mpsc::channel();
         let ctx3 = ctx.clone();
         let gpath = path.clone();
@@ -394,12 +611,12 @@ impl CodeLookApp {
             let _ = gtx.send((status, branch));
             ctx3.request_repaint();
         });
-        self.git_rx = Some(grx);
+        self.ws.git_rx = Some(grx);
 
         // For a git repository, open the commit log automatically and load it.
-        self.log_open = false;
+        self.ws.log_open = false;
         if crate::git::current_branch(&path).is_some() {
-            self.log_open = true;
+            self.ws.log_open = true;
             let (ctx4, cpath) = (ctx.clone(), path.clone());
             let (ctx_tx, ctx_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -407,17 +624,19 @@ impl CodeLookApp {
                 let _ = ctx_tx.send(log);
                 ctx4.request_repaint();
             });
-            self.commits_rx = Some(ctx_rx);
+            self.ws.commits_rx = Some(ctx_rx);
         }
     }
 
     fn open_file(&mut self, path: PathBuf) {
-        if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
-            self.active = Some(i);
+        if let Some(i) = self.ws.tabs.iter().position(|t| t.path == path) {
+            self.ws.active = Some(i);
+            self.ws.diff_view = None; // an open diff would keep covering the editor
             return;
         }
         match std::fs::read_to_string(&path) {
             Ok(content) => {
+                self.ws.diff_view = None;
                 let job =
                     self.highlighter
                         .highlight(path.to_str().unwrap_or(""), &content, self.font_size);
@@ -426,19 +645,20 @@ impl CodeLookApp {
                     .map(|l| ast::document_symbols(l, &content))
                     .unwrap_or_default();
                 let git_changes = self
+                    .ws
                     .project_root
                     .as_ref()
                     .and_then(|root| crate::git::file_line_changes(root, &path))
                     .unwrap_or_default();
                 let mut tab = Tab::new(path, content, job, self.font_size, lang, outline);
                 tab.git_changes = git_changes;
-                self.tabs.push(tab);
-                self.active = Some(self.tabs.len() - 1);
-                self.status.clear();
+                self.ws.tabs.push(tab);
+                self.ws.active = Some(self.ws.tabs.len() - 1);
+                self.ws.status.clear();
                 self.refresh_search();
             }
             Err(_) => {
-                self.status = format!(
+                self.ws.status = format!(
                     "열 수 없는 파일(바이너리 또는 권한): {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
                 );
@@ -451,46 +671,46 @@ impl CodeLookApp {
     /// Record a visited location, truncating any forward history (browser model).
     fn record_nav(&mut self, path: PathBuf, line: usize) {
         let loc = NavLoc { path, line };
-        if self.history.get(self.hist_pos) == Some(&loc) {
+        if self.ws.history.get(self.ws.hist_pos) == Some(&loc) {
             return; // already here
         }
-        if !self.history.is_empty() {
-            self.history.truncate(self.hist_pos + 1);
+        if !self.ws.history.is_empty() {
+            self.ws.history.truncate(self.ws.hist_pos + 1);
         }
-        self.history.push(loc);
-        self.hist_pos = self.history.len() - 1;
+        self.ws.history.push(loc);
+        self.ws.hist_pos = self.ws.history.len() - 1;
     }
 
     fn can_back(&self) -> bool {
-        !self.history.is_empty() && self.hist_pos > 0
+        !self.ws.history.is_empty() && self.ws.hist_pos > 0
     }
 
     fn can_forward(&self) -> bool {
-        self.hist_pos + 1 < self.history.len()
+        self.ws.hist_pos + 1 < self.ws.history.len()
     }
 
     fn nav_back(&mut self) {
         if !self.can_back() {
             return;
         }
-        self.hist_pos -= 1;
-        self.go_to_loc(self.history[self.hist_pos].clone());
+        self.ws.hist_pos -= 1;
+        self.go_to_loc(self.ws.history[self.ws.hist_pos].clone());
     }
 
     fn nav_forward(&mut self) {
         if !self.can_forward() {
             return;
         }
-        self.hist_pos += 1;
-        self.go_to_loc(self.history[self.hist_pos].clone());
+        self.ws.hist_pos += 1;
+        self.go_to_loc(self.ws.history[self.ws.hist_pos].clone());
     }
 
     /// Navigate to a history location WITHOUT recording (avoids feedback loops).
     fn go_to_loc(&mut self, loc: NavLoc) {
         self.open_file(loc.path.clone());
-        if let Some(i) = self.active {
-            self.tabs[i].scroll_to_line = Some(loc.line);
-            self.tabs[i].flash_line = Some(loc.line);
+        if let Some(i) = self.ws.active {
+            self.ws.tabs[i].scroll_to_line = Some(loc.line);
+            self.ws.tabs[i].flash_line = Some(loc.line);
         }
     }
 
@@ -498,94 +718,94 @@ impl CodeLookApp {
 
     /// Create the persistent search worker for the current project root.
     fn ensure_gsearch_worker(&mut self, ctx: &egui::Context) {
-        if self.gsearch_worker.is_some() {
+        if self.ws.gsearch_worker.is_some() {
             return;
         }
-        let root = match &self.project_root {
+        let root = match &self.ws.project_root {
             Some(r) => r.clone(),
             None => return,
         };
         let ctx2 = ctx.clone();
         let (worker, rx) = crate::search::Worker::new(root, move || ctx2.request_repaint());
-        self.gsearch_worker = Some(worker);
-        self.gsearch_rx = Some(rx);
+        self.ws.gsearch_worker = Some(worker);
+        self.ws.gsearch_rx = Some(rx);
     }
 
     /// Pre-build the file snapshot (called when the search popup opens), so
     /// the first real query only pays the scan, not the initial disk walk.
     fn gsearch_warm(&mut self, ctx: &egui::Context) {
         self.ensure_gsearch_worker(ctx);
-        if let (Some(w), None) = (&self.gsearch_worker, &self.gsearch_cancel) {
-            self.gsearch_cancel = Some(w.submit(String::new()));
+        if let (Some(w), None) = (&self.ws.gsearch_worker, &self.ws.gsearch_cancel) {
+            self.ws.gsearch_cancel = Some(w.submit(String::new()));
         }
     }
 
     /// Queue the current query on the worker (min 2 chars), cancelling the
     /// previous one.
     fn gsearch_kick(&mut self, ctx: &egui::Context) {
-        if let Some(c) = &self.gsearch_cancel {
+        if let Some(c) = &self.ws.gsearch_cancel {
             c.store(true, std::sync::atomic::Ordering::Relaxed);
-            self.gsearch_cancel = None;
+            self.ws.gsearch_cancel = None;
         }
-        let query = self.gsearch_query.clone();
+        let query = self.ws.gsearch_query.clone();
         if query.trim().len() < 2 {
-            self.gsearch_results.clear();
-            self.gsearch_files = 0;
-            self.gsearch_truncated = false;
-            self.gsearch_running = false;
+            self.ws.gsearch_results.clear();
+            self.ws.gsearch_files = 0;
+            self.ws.gsearch_truncated = false;
+            self.ws.gsearch_running = false;
             return;
         }
         self.ensure_gsearch_worker(ctx);
-        if let Some(w) = &self.gsearch_worker {
-            self.gsearch_cancel = Some(w.submit(query));
-            self.gsearch_running = true;
+        if let Some(w) = &self.ws.gsearch_worker {
+            self.ws.gsearch_cancel = Some(w.submit(query));
+            self.ws.gsearch_running = true;
         }
     }
 
     /// Accept background results matching the current query (drop stale).
     fn gsearch_poll(&mut self) {
         let mut accepted = None;
-        if let Some(rx) = &self.gsearch_rx {
+        if let Some(rx) = &self.ws.gsearch_rx {
             while let Ok(reply) = rx.try_recv() {
-                if reply.0 == self.gsearch_query {
+                if reply.0 == self.ws.gsearch_query {
                     accepted = Some(reply);
                 }
             }
         }
         if let Some((_, hits, truncated)) = accepted {
-            self.gsearch_files = count_hit_files(&hits);
-            self.gsearch_results = hits;
-            self.gsearch_truncated = truncated;
-            self.gsearch_sel = 0;
-            self.gsearch_running = false;
+            self.ws.gsearch_files = count_hit_files(&hits);
+            self.ws.gsearch_results = hits;
+            self.ws.gsearch_truncated = truncated;
+            self.ws.gsearch_sel = 0;
+            self.ws.gsearch_running = false;
         }
     }
 
     /// Prepare the preview pane for the currently selected search hit: highlight
     /// the file (cached per path) and mark it to scroll to the matched line.
     fn ensure_gpreview(&mut self) {
-        let hit = match self.gsearch_results.get(self.gsearch_sel) {
+        let hit = match self.ws.gsearch_results.get(self.ws.gsearch_sel) {
             Some(h) => h.clone(),
             None => {
-                self.gpreview_path = None;
-                self.gpreview_job = LayoutJob::default();
-                self.gpreview_content.clear();
-                self.gpreview_marks.clear();
-                self.gpreview_lines = 0;
+                self.ws.gpreview_path = None;
+                self.ws.gpreview_job = LayoutJob::default();
+                self.ws.gpreview_content.clear();
+                self.ws.gpreview_marks.clear();
+                self.ws.gpreview_lines = 0;
                 return;
             }
         };
-        let path_changed = self.gpreview_path.as_deref() != Some(hit.path.as_path());
+        let path_changed = self.ws.gpreview_path.as_deref() != Some(hit.path.as_path());
         if path_changed {
             match std::fs::read_to_string(&hit.path) {
                 Ok(content) => {
-                    self.gpreview_job = self.highlighter.highlight(
+                    self.ws.gpreview_job = self.highlighter.highlight(
                         hit.path.to_str().unwrap_or(""),
                         &content,
                         13.0,
                     );
                     let lines = content.lines().count().max(1);
-                    self.gpreview_lines = lines;
+                    self.ws.gpreview_lines = lines;
                     // Matching line-number gutter (same line height as the code).
                     let lh = crate::highlight::line_height(13.0);
                     let digits = lines.to_string().len();
@@ -599,35 +819,35 @@ impl CodeLookApp {
                         fmt.line_height = Some(lh);
                         g.append(&format!("{:>width$}\n", i, width = digits), 0.0, fmt);
                     }
-                    self.gpreview_gutter = g;
-                    self.gpreview_content = content;
+                    self.ws.gpreview_gutter = g;
+                    self.ws.gpreview_content = content;
                 }
                 Err(_) => {
-                    self.gpreview_job = LayoutJob::default();
-                    self.gpreview_gutter = LayoutJob::default();
-                    self.gpreview_content.clear();
-                    self.gpreview_lines = 0;
+                    self.ws.gpreview_job = LayoutJob::default();
+                    self.ws.gpreview_gutter = LayoutJob::default();
+                    self.ws.gpreview_content.clear();
+                    self.ws.gpreview_lines = 0;
                 }
             }
-            self.gpreview_path = Some(hit.path.clone());
-            self.gpreview_line = hit.line;
-            self.gpreview_focus_ci = char_index_of(&self.gpreview_content, hit.line, hit.col);
-            self.gpreview_scroll = true;
-        } else if self.gpreview_line != hit.line {
-            self.gpreview_line = hit.line;
-            self.gpreview_focus_ci = char_index_of(&self.gpreview_content, hit.line, hit.col);
-            self.gpreview_scroll = true;
+            self.ws.gpreview_path = Some(hit.path.clone());
+            self.ws.gpreview_line = hit.line;
+            self.ws.gpreview_focus_ci = char_index_of(&self.ws.gpreview_content, hit.line, hit.col);
+            self.ws.gpreview_scroll = true;
+        } else if self.ws.gpreview_line != hit.line {
+            self.ws.gpreview_line = hit.line;
+            self.ws.gpreview_focus_ci = char_index_of(&self.ws.gpreview_content, hit.line, hit.col);
+            self.ws.gpreview_scroll = true;
         }
 
         // (Re)compute match markers when the file or the query term changes.
         // Matching is ASCII-case-insensitive (crate::search), so byte offsets
         // are exact and a match's char length equals the query's.
-        let needle = self.gsearch_query.clone();
-        if path_changed || needle != self.gpreview_needle {
+        let needle = self.ws.gsearch_query.clone();
+        if path_changed || needle != self.ws.gpreview_needle {
             let mut marks = Vec::new();
             let len_char = needle.chars().count();
             if !needle.is_empty() {
-                let content = &self.gpreview_content;
+                let content = &self.ws.gpreview_content;
                 let mut prev_byte = 0usize;
                 let mut char_idx = 0usize;
                 for bpos in
@@ -638,17 +858,17 @@ impl CodeLookApp {
                     marks.push((char_idx, len_char));
                 }
             }
-            self.gpreview_needle = needle;
-            self.gpreview_marks = marks;
+            self.ws.gpreview_needle = needle;
+            self.ws.gpreview_marks = marks;
         }
     }
 
     // ---- Commit log / diff -------------------------------------------------
 
     fn toggle_log(&mut self, ctx: &egui::Context) {
-        self.log_open = !self.log_open;
-        if self.log_open && self.commits.is_empty() && self.commits_rx.is_none() {
-            if let Some(root) = self.project_root.clone() {
+        self.ws.log_open = !self.ws.log_open;
+        if self.ws.log_open && self.ws.commits.is_empty() && self.ws.commits_rx.is_none() {
+            if let Some(root) = self.ws.project_root.clone() {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let c = ctx.clone();
                 std::thread::spawn(move || {
@@ -656,30 +876,33 @@ impl CodeLookApp {
                     let _ = tx.send(log);
                     c.request_repaint();
                 });
-                self.commits_rx = Some(rx);
+                self.ws.commits_rx = Some(rx);
             }
         }
     }
 
     /// Select a commit and load its changed-file list (synchronously).
     fn select_commit(&mut self, idx: usize) {
-        self.commit_sel = idx;
-        if let (Some(root), Some(c)) = (self.project_root.clone(), self.commits.get(idx).cloned()) {
-            self.commit_files = crate::git::commit_files(&root, &c.id);
-            self.commit_files_for = c.id;
+        self.ws.commit_sel = idx;
+        if let (Some(root), Some(c)) = (self.ws.project_root.clone(), self.ws.commits.get(idx).cloned()) {
+            self.ws.commit_files = crate::git::commit_files(&root, &c.id);
+            self.ws.commit_files_for = c.id;
         }
     }
 
     /// Open the unified diff of `file` in the selected commit.
     fn open_commit_diff(&mut self, file: String) {
         if let (Some(root), Some(c)) =
-            (self.project_root.clone(), self.commits.get(self.commit_sel).cloned())
+            (self.ws.project_root.clone(), self.ws.commits.get(self.ws.commit_sel).cloned())
         {
             let lines = crate::git::commit_file_diff(&root, &c.id, &file);
-            self.diff_view = Some(DiffView {
+            let jobs = build_diff_jobs(&self.highlighter, &file, &lines, self.font_size);
+            self.ws.diff_view = Some(DiffView {
                 commit_short: c.short.clone(),
                 file,
                 lines,
+                jobs,
+                jobs_font: self.font_size,
             });
         }
     }
@@ -687,21 +910,23 @@ impl CodeLookApp {
     /// Open a file at a line, recording it in the nav history.
     fn navigate_to(&mut self, path: PathBuf, line: usize) {
         self.open_file(path.clone());
-        if let Some(i) = self.active {
-            self.tabs[i].scroll_to_line = Some(line);
-            self.tabs[i].flash_line = Some(line);
+        if let Some(i) = self.ws.active {
+            self.ws.tabs[i].scroll_to_line = Some(line);
+            self.ws.tabs[i].flash_line = Some(line);
         }
         self.record_nav(path, line);
     }
 
     fn goto_definition(&mut self, name: &str) {
-        let cur_path = self.active.and_then(|i| self.tabs.get(i)).map(|t| t.path.clone());
+        let cur_path = self.ws.active.and_then(|i| self.ws.tabs.get(i)).map(|t| t.path.clone());
         let cur_line = self
+            .ws
             .active
-            .and_then(|i| self.tabs.get(i))
+            .and_then(|i| self.ws.tabs.get(i))
             .and_then(|t| t.flash_line);
 
         let matches: Vec<_> = self
+            .ws
             .symbol_index
             .as_ref()
             .and_then(|idx| idx.get(name))
@@ -709,7 +934,7 @@ impl CodeLookApp {
             .unwrap_or_default();
 
         if matches.is_empty() {
-            self.status = if self.indexing {
+            self.ws.status = if self.ws.indexing {
                 format!("⌘+클릭 ‘{name}’ — 인덱싱 중, 잠시 후 다시 시도")
             } else {
                 format!("⌘+클릭 ‘{name}’ — 정의를 찾지 못함")
@@ -739,9 +964,9 @@ impl CodeLookApp {
             .unwrap();
 
         self.open_file(pick.path.clone());
-        if let Some(i) = self.active {
-            self.tabs[i].scroll_to_line = Some(pick.line);
-            self.tabs[i].flash_line = Some(pick.line);
+        if let Some(i) = self.ws.active {
+            self.ws.tabs[i].scroll_to_line = Some(pick.line);
+            self.ws.tabs[i].flash_line = Some(pick.line);
         }
         self.record_nav(pick.path.clone(), pick.line);
 
@@ -750,7 +975,7 @@ impl CodeLookApp {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        self.status = if matches.len() > 1 {
+        self.ws.status = if matches.len() > 1 {
             format!(
                 "⌘+클릭 ‘{name}’ → {}:{} (정의 {}곳 중 1)",
                 where_,
@@ -763,7 +988,7 @@ impl CodeLookApp {
     }
 
     fn rehighlight_open_tabs(&mut self) {
-        for tab in &mut self.tabs {
+        for tab in &mut self.ws.tabs {
             if (tab.job_font - self.font_size).abs() > f32::EPSILON {
                 tab.job = self.highlighter.highlight(
                     tab.path.to_str().unwrap_or(""),
@@ -778,16 +1003,16 @@ impl CodeLookApp {
     // ---- search -------------------------------------------------------------
 
     fn refresh_search(&mut self) {
-        self.search_matches.clear();
-        self.search_cur = 0;
-        let q = self.search_query.to_lowercase();
+        self.ws.search_matches.clear();
+        self.ws.search_cur = 0;
+        let q = self.ws.search_query.to_lowercase();
         if q.is_empty() {
             return;
         }
-        if let Some(i) = self.active {
-            for (n, line) in self.tabs[i].content.lines().enumerate() {
+        if let Some(i) = self.ws.active {
+            for (n, line) in self.ws.tabs[i].content.lines().enumerate() {
                 if line.to_lowercase().contains(&q) {
-                    self.search_matches.push(n);
+                    self.ws.search_matches.push(n);
                 }
             }
         }
@@ -818,28 +1043,44 @@ impl CodeLookApp {
     }
 
     fn search_step(&mut self, forward: bool) {
-        if self.search_matches.is_empty() {
+        if self.ws.search_matches.is_empty() {
             return;
         }
-        let len = self.search_matches.len();
-        self.search_cur = if forward {
-            (self.search_cur + 1) % len
+        let len = self.ws.search_matches.len();
+        self.ws.search_cur = if forward {
+            (self.ws.search_cur + 1) % len
         } else {
-            (self.search_cur + len - 1) % len
+            (self.ws.search_cur + len - 1) % len
         };
-        let line = self.search_matches[self.search_cur];
-        if let Some(i) = self.active {
-            self.tabs[i].scroll_to_line = Some(line);
-            self.tabs[i].flash_line = Some(line);
+        let line = self.ws.search_matches[self.ws.search_cur];
+        if let Some(i) = self.ws.active {
+            self.ws.tabs[i].scroll_to_line = Some(line);
+            self.ws.tabs[i].flash_line = Some(line);
         }
     }
 }
 
 impl eframe::App for CodeLookApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if let Some(p) = &self.project_root {
+        if let Some(p) = &self.ws.project_root {
             storage.set_string("last_project", p.to_string_lossy().to_string());
         }
+        // All open projects (in open order) so the whole set restores.
+        let mut all: Vec<(usize, String)> = self
+            .parked
+            .iter()
+            .chain(std::iter::once(&self.ws))
+            .filter_map(|w| {
+                w.project_root
+                    .as_ref()
+                    .map(|p| (w.seq, p.to_string_lossy().to_string()))
+            })
+            .collect();
+        all.sort_by_key(|(seq, _)| *seq);
+        storage.set_string(
+            "open_projects",
+            all.into_iter().map(|(_, p)| p).collect::<Vec<_>>().join("\n"),
+        );
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -847,29 +1088,29 @@ impl eframe::App for CodeLookApp {
             self.drive_capture(ctx);
         }
 
-        if let Some(rx) = &self.index_rx {
+        if let Some(rx) = &self.ws.index_rx {
             if let Ok(idx) = rx.try_recv() {
                 let count = idx.len();
-                self.symbol_index = Some(idx);
-                self.indexing = false;
-                self.index_rx = None;
-                self.status = format!("인덱싱 완료 · 심볼 {count}개");
+                self.ws.symbol_index = Some(idx);
+                self.ws.indexing = false;
+                self.ws.index_rx = None;
+                self.ws.status = format!("인덱싱 완료 · 심볼 {count}개");
             }
         }
 
-        if let Some(rx) = &self.git_rx {
+        if let Some(rx) = &self.ws.git_rx {
             if let Ok((status, branch)) = rx.try_recv() {
-                self.git_status = status;
-                self.git_branch = branch;
-                self.git_rx = None;
+                self.ws.git_status = status;
+                self.ws.git_branch = branch;
+                self.ws.git_rx = None;
             }
         }
 
-        if let Some(rx) = &self.commits_rx {
+        if let Some(rx) = &self.ws.commits_rx {
             if let Ok(list) = rx.try_recv() {
-                self.commits = list;
-                self.commits_rx = None;
-                if !self.commits.is_empty() {
+                self.ws.commits = list;
+                self.ws.commits_rx = None;
+                if !self.ws.commits.is_empty() {
                     self.select_commit(0);
                 }
             }
@@ -896,18 +1137,18 @@ impl eframe::App for CodeLookApp {
                 forward,
             )
         });
-        if open_find && self.active.is_some() {
-            self.search_open = true;
-            self.search_focus = true;
+        if open_find && self.ws.active.is_some() {
+            self.ws.search_open = true;
+            self.ws.search_focus = true;
         }
-        if open_gfind && self.project_root.is_some() {
-            self.gsearch_open = true;
-            self.gsearch_focus = true;
+        if open_gfind && self.ws.project_root.is_some() {
+            self.ws.gsearch_open = true;
+            self.ws.gsearch_focus = true;
             self.gsearch_warm(ctx);
         }
         if esc {
-            self.search_open = false;
-            self.gsearch_open = false;
+            self.ws.search_open = false;
+            self.ws.gsearch_open = false;
         }
         if back {
             self.nav_back();
@@ -922,14 +1163,14 @@ impl eframe::App for CodeLookApp {
         self.gsearch_poll();
         let now = ctx.input(|i| i.time);
         if self.shot.is_some() {
-            self.gsearch_prev = self.gsearch_query.clone();
-        } else if self.gsearch_query != self.gsearch_prev {
-            self.gsearch_prev = self.gsearch_query.clone();
-            self.gsearch_dirty_at = Some(now);
+            self.ws.gsearch_prev = self.ws.gsearch_query.clone();
+        } else if self.ws.gsearch_query != self.ws.gsearch_prev {
+            self.ws.gsearch_prev = self.ws.gsearch_query.clone();
+            self.ws.gsearch_dirty_at = Some(now);
         }
-        if let Some(t0) = self.gsearch_dirty_at {
+        if let Some(t0) = self.ws.gsearch_dirty_at {
             if now - t0 > 0.12 {
-                self.gsearch_dirty_at = None;
+                self.ws.gsearch_dirty_at = None;
                 self.gsearch_kick(ctx);
             } else {
                 ctx.request_repaint();
@@ -967,15 +1208,34 @@ impl CodeLookApp {
                     }
                     sep_dot(ui);
 
-                    if let Some(root) = &self.project_root {
-                        ui.label(
-                            egui::RichText::new(
-                                root.file_name().unwrap_or_default().to_string_lossy(),
-                            )
-                            .strong()
-                            .size(13.5)
-                            .color(C_TEXT),
-                        );
+                    // Project tabs: every open project, sorted by open order.
+                    let mut projects: Vec<(usize, String, PathBuf, bool)> = Vec::new();
+                    if let Some(r) = &self.ws.project_root {
+                        let name = r.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        projects.push((self.ws.seq, name, r.clone(), true));
+                    }
+                    for w in &self.parked {
+                        if let Some(r) = &w.project_root {
+                            let name =
+                                r.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            projects.push((w.seq, name, r.clone(), false));
+                        }
+                    }
+                    projects.sort_by_key(|p| p.0);
+                    let mut switch_to: Option<PathBuf> = None;
+                    let mut close_p: Option<PathBuf> = None;
+                    for (seq, name, root, is_active) in &projects {
+                        if project_chip(ui, *seq, name, *is_active, &mut close_p, root) {
+                            switch_to = Some(root.clone());
+                        }
+                    }
+                    if let Some(r) = switch_to {
+                        self.switch_project(&r);
+                    }
+                    if let Some(r) = close_p {
+                        self.close_project(&r);
+                    }
+                    if !projects.is_empty() {
                         ui.add_space(2.0);
                         sep_dot(ui);
                     }
@@ -985,15 +1245,15 @@ impl CodeLookApp {
                             self.open_project(ctx, dir);
                         }
                     }
-                    if ui.button("검색").on_hover_text("⌘F").clicked() && self.active.is_some() {
-                        self.search_open = true;
-                        self.search_focus = true;
+                    if ui.button("검색").on_hover_text("⌘F").clicked() && self.ws.active.is_some() {
+                        self.ws.search_open = true;
+                        self.ws.search_focus = true;
                     }
                     if ui.button("전체 검색").on_hover_text("⇧⌘F").clicked()
-                        && self.project_root.is_some()
+                        && self.ws.project_root.is_some()
                     {
-                        self.gsearch_open = true;
-                        self.gsearch_focus = true;
+                        self.ws.gsearch_open = true;
+                        self.ws.gsearch_focus = true;
                         self.gsearch_warm(ctx);
                     }
 
@@ -1006,7 +1266,7 @@ impl CodeLookApp {
                     if panel_toggle(ui, PanelSide::Right, self.structure_open, "구조(STRUCTURE)") {
                         self.structure_open = !self.structure_open;
                     }
-                    if panel_toggle(ui, PanelSide::Bottom, self.log_open, "커밋 로그") {
+                    if panel_toggle(ui, PanelSide::Bottom, self.ws.log_open, "커밋 로그") {
                         self.toggle_log(ctx);
                     }
                     sep_dot(ui);
@@ -1027,13 +1287,13 @@ impl CodeLookApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        if self.indexing {
+                        if self.ws.indexing {
                             ui.spinner();
                         }
-                        let hint = if self.status.is_empty() {
+                        let hint = if self.ws.status.is_empty() {
                             "⌘+클릭 정의 이동 · ⌘C 복사".to_string()
                         } else {
-                            self.status.clone()
+                            self.ws.status.clone()
                         };
                         ui.label(
                             egui::RichText::new(hint).color(C_TEXT_DIM).size(12.0),
@@ -1055,18 +1315,19 @@ impl CodeLookApp {
             .show(ctx, |ui| {
                 tool_window_header(ui, "PROJECT", None);
                 egui::ScrollArea::both()
-                    .id_salt("tree_scroll")
+                    .id_salt(("tree_scroll", self.ws.seq))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         let active_path = self
+                            .ws
                             .active
-                            .and_then(|i| self.tabs.get(i))
+                            .and_then(|i| self.ws.tabs.get(i))
                             .map(|t| t.path.clone());
                         let mut to_open = None;
-                        let status = &self.git_status;
+                        let status = &self.ws.git_status;
                         let icons = &self.icons;
-                        if let Some(root) = &mut self.tree {
+                        if let Some(root) = &mut self.ws.tree {
                             show_node(ui, root, 0, active_path.as_deref(), status, icons, &mut to_open);
                         } else {
                             ui.add_space(20.0);
@@ -1091,11 +1352,11 @@ impl CodeLookApp {
         if !self.structure_open {
             return;
         }
-        let i = match self.active {
-            Some(i) if i < self.tabs.len() => i,
+        let i = match self.ws.active {
+            Some(i) if i < self.ws.tabs.len() => i,
             _ => return,
         };
-        let lang_label = self.tabs[i].lang.map(|l| l.label()).unwrap_or("Plain");
+        let lang_label = self.ws.tabs[i].lang.map(|l| l.label()).unwrap_or("Plain");
         egui::SidePanel::right("structure_panel")
             .resizable(true)
             .default_width(240.0)
@@ -1104,7 +1365,7 @@ impl CodeLookApp {
             .show(ctx, |ui| {
                 tool_window_header(ui, "STRUCTURE", Some(lang_label));
 
-                if self.tabs[i].outline.is_empty() {
+                if self.ws.tabs[i].outline.is_empty() {
                     ui.add_space(14.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
@@ -1114,20 +1375,20 @@ impl CodeLookApp {
                 } else {
                     let mut jump = None;
                     egui::ScrollArea::vertical()
-                        .id_salt("structure_scroll")
+                        .id_salt(("structure_scroll", self.ws.seq))
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
-                            for s in &self.tabs[i].outline {
+                            for s in &self.ws.tabs[i].outline {
                                 if symbol_row(ui, s, &self.icons) {
                                     jump = Some(s.line);
                                 }
                             }
                         });
                     if let Some(line) = jump {
-                        self.tabs[i].scroll_to_line = Some(line);
-                        self.tabs[i].flash_line = Some(line);
-                        let p = self.tabs[i].path.clone();
+                        self.ws.tabs[i].scroll_to_line = Some(line);
+                        self.ws.tabs[i].flash_line = Some(line);
+                        let p = self.ws.tabs[i].path.clone();
                         self.record_nav(p, line);
                     }
                 }
@@ -1156,14 +1417,14 @@ impl CodeLookApp {
                     Stroke::new(1.0, C_BORDER),
                 );
 
-                let Some(root) = self.project_root.as_ref() else {
+                let Some(root) = self.ws.project_root.as_ref() else {
                     return;
                 };
                 let font = FontId::proportional(12.0);
                 let cy = rect.center().y;
 
                 // Breadcrumbs (left) — only when a file is open.
-                if let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) {
+                if let Some(tab) = self.ws.active.and_then(|i| self.ws.tabs.get(i)) {
                     let mut crumbs: Vec<String> = vec![root
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
@@ -1201,11 +1462,11 @@ impl CodeLookApp {
 
                 // Right side: [line count · lang]  ·  ⑂ branch.
                 let mut right = String::new();
-                if let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) {
+                if let Some(tab) = self.ws.active.and_then(|i| self.ws.tabs.get(i)) {
                     let lang = tab.lang.map(|l| l.label()).unwrap_or("Text");
                     right = format!("{} lines   ·   {}", tab.line_count, lang);
                 }
-                if let Some(branch) = &self.git_branch {
+                if let Some(branch) = &self.ws.git_branch {
                     if !right.is_empty() {
                         right.push_str("   ·   ");
                     }
@@ -1229,13 +1490,13 @@ impl CodeLookApp {
     /// preview of the selected match on the right (IntelliJ-style). Typing
     /// updates results live; ↑/↓ move the selection, Enter / double-click opens.
     fn global_search_window(&mut self, ctx: &egui::Context) {
-        if !self.gsearch_open {
+        if !self.ws.gsearch_open {
             return;
         }
-        let root = self.project_root.clone().unwrap_or_default();
+        let root = self.ws.project_root.clone().unwrap_or_default();
 
         // Keyboard selection (handled here so the preview can update this frame).
-        let n = self.gsearch_results.len();
+        let n = self.ws.gsearch_results.len();
         let (up, down, enter) = ctx.input(|i| {
             (
                 i.key_pressed(Key::ArrowUp),
@@ -1246,17 +1507,17 @@ impl CodeLookApp {
         let mut key_moved = false;
         if n > 0 {
             if down {
-                self.gsearch_sel = (self.gsearch_sel + 1).min(n - 1);
+                self.ws.gsearch_sel = (self.ws.gsearch_sel + 1).min(n - 1);
                 key_moved = true;
             }
             if up {
-                self.gsearch_sel = self.gsearch_sel.saturating_sub(1);
+                self.ws.gsearch_sel = self.ws.gsearch_sel.saturating_sub(1);
                 key_moved = true;
             }
         }
         let mut navigate: Option<(PathBuf, usize)> = None;
         if enter {
-            if let Some(h) = self.gsearch_results.get(self.gsearch_sel) {
+            if let Some(h) = self.ws.gsearch_results.get(self.ws.gsearch_sel) {
                 navigate = Some((h.path.clone(), h.line));
             }
         }
@@ -1265,20 +1526,20 @@ impl CodeLookApp {
         self.ensure_gpreview();
 
         // Move fields into locals so the Window closure doesn't alias `self`.
-        let mut query = std::mem::take(&mut self.gsearch_query);
-        let results = std::mem::take(&mut self.gsearch_results);
-        let preview_job = std::mem::take(&mut self.gpreview_job);
-        let preview_gutter = std::mem::take(&mut self.gpreview_gutter);
-        let preview_marks = std::mem::take(&mut self.gpreview_marks);
+        let mut query = std::mem::take(&mut self.ws.gsearch_query);
+        let results = std::mem::take(&mut self.ws.gsearch_results);
+        let preview_job = std::mem::take(&mut self.ws.gpreview_job);
+        let preview_gutter = std::mem::take(&mut self.ws.gpreview_gutter);
+        let preview_marks = std::mem::take(&mut self.ws.gpreview_marks);
         let needle = query.clone(); // markers match ASCII-case-insensitively
         let needle_len_char = needle.chars().count();
-        let focus_ci = self.gpreview_focus_ci;
-        let mut sel = self.gsearch_sel;
-        let running = self.gsearch_running;
-        let truncated = self.gsearch_truncated;
-        let mut want_focus = self.gsearch_focus;
-        let preview_line = self.gpreview_line;
-        let mut do_scroll = self.gpreview_scroll || key_moved;
+        let focus_ci = self.ws.gpreview_focus_ci;
+        let mut sel = self.ws.gsearch_sel;
+        let running = self.ws.gsearch_running;
+        let truncated = self.ws.gsearch_truncated;
+        let mut want_focus = self.ws.gsearch_focus;
+        let preview_line = self.ws.gpreview_line;
+        let mut do_scroll = self.ws.gpreview_scroll || key_moved;
         let mut keep_open = true;
 
         let status = if running {
@@ -1290,7 +1551,7 @@ impl CodeLookApp {
         } else {
             format!(
                 "{}개 파일에서 {}건{}",
-                self.gsearch_files,
+                self.ws.gsearch_files,
                 results.len(),
                 if truncated { " (상한 도달)" } else { "" }
             )
@@ -1556,30 +1817,30 @@ impl CodeLookApp {
             });
 
         // Restore fields and apply outputs.
-        self.gsearch_query = query;
-        self.gsearch_results = results;
-        self.gpreview_job = preview_job;
-        self.gpreview_gutter = preview_gutter;
-        self.gpreview_marks = preview_marks;
-        self.gsearch_sel = sel;
-        self.gsearch_focus = want_focus;
-        self.gpreview_scroll = false;
+        self.ws.gsearch_query = query;
+        self.ws.gsearch_results = results;
+        self.ws.gpreview_job = preview_job;
+        self.ws.gpreview_gutter = preview_gutter;
+        self.ws.gpreview_marks = preview_marks;
+        self.ws.gsearch_sel = sel;
+        self.ws.gsearch_focus = want_focus;
+        self.ws.gpreview_scroll = false;
 
         if let Some((p, l)) = navigate {
             self.navigate_to(p, l);
-            self.gsearch_open = false;
+            self.ws.gsearch_open = false;
         }
         if !keep_open {
-            self.gsearch_open = false;
+            self.ws.gsearch_open = false;
         }
     }
 
     /// Bottom Git-Log tool window: commits (left) + changed files (right).
     fn git_log_panel(&mut self, ctx: &egui::Context) {
-        if !self.log_open {
+        if !self.ws.log_open {
             return;
         }
-        let loading = self.commits_rx.is_some();
+        let loading = self.ws.commits_rx.is_some();
         let mut sel_commit: Option<usize> = None;
         let mut open_file: Option<String> = None;
         let mut close = false;
@@ -1603,7 +1864,7 @@ impl CodeLookApp {
                 let count_label = if loading {
                     "불러오는 중…".to_string()
                 } else {
-                    format!("{}개", self.commits.len())
+                    format!("{}개", self.ws.commits.len())
                 };
                 p.text(
                     egui::pos2(hr.right() - 30.0, hr.center().y),
@@ -1631,30 +1892,30 @@ impl CodeLookApp {
                 let total_w = ui.available_width();
                 // Draggable split between the commit list and the file list.
                 let min_side = 240.0_f32.min(total_w * 0.3);
-                let left_w = (total_w * self.log_split).clamp(min_side, (total_w - min_side).max(min_side));
+                let left_w = (total_w * self.ws.log_split).clamp(min_side, (total_w - min_side).max(min_side));
                 ui.horizontal_top(|ui| {
                     // Commit list.
                     ui.vertical(|ui| {
                         ui.set_min_width(left_w);
                         ui.set_max_width(left_w);
                         egui::ScrollArea::vertical()
-                            .id_salt("commit_list")
+                            .id_salt(("commit_list", self.ws.seq))
                             .max_height(body_h)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
-                                for (i, c) in self.commits.iter().enumerate() {
+                                for (i, c) in self.ws.commits.iter().enumerate() {
                                     let (rr, resp) = ui.allocate_exact_size(
                                         Vec2::new(ui.available_width(), 24.0),
                                         Sense::click(),
                                     );
                                     let p = ui.painter();
-                                    if i == self.commit_sel {
+                                    if i == self.ws.commit_sel {
                                         p.rect_filled(rr, 0.0, C_SEL);
                                     } else if resp.hovered() {
                                         p.rect_filled(rr, 0.0, C_HOVER);
                                     }
-                                    let sel = i == self.commit_sel;
+                                    let sel = i == self.ws.commit_sel;
                                     p.text(
                                         egui::pos2(rr.left() + 10.0, rr.center().y),
                                         Align2::LEFT_CENTER,
@@ -1691,7 +1952,7 @@ impl CodeLookApp {
                     }
                     if dresp.dragged() {
                         let x = left_w + dresp.drag_delta().x;
-                        self.log_split = (x / total_w).clamp(0.12, 0.88);
+                        self.ws.log_split = (x / total_w).clamp(0.12, 0.88);
                     }
                     let line_c = if dresp.hovered() || dresp.dragged() {
                         C_ACCENT
@@ -1705,18 +1966,19 @@ impl CodeLookApp {
                     ui.vertical(|ui| {
                         ui.set_min_height(body_h);
                         egui::ScrollArea::vertical()
-                            .id_salt("commit_files")
+                            .id_salt(("commit_files", self.ws.seq))
                             .max_height(body_h)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
-                                for f in &self.commit_files {
+                                for f in &self.ws.commit_files {
                                     let (rr, resp) = ui.allocate_exact_size(
                                         Vec2::new(ui.available_width(), 22.0),
                                         Sense::click(),
                                     );
                                     let p = ui.painter();
                                     let is_open = self
+                                        .ws
                                         .diff_view
                                         .as_ref()
                                         .map(|d| d.file == f.path)
@@ -1757,7 +2019,7 @@ impl CodeLookApp {
             });
 
         if close {
-            self.log_open = false;
+            self.ws.log_open = false;
         }
         if let Some(i) = sel_commit {
             self.select_commit(i);
@@ -1773,15 +2035,15 @@ impl CodeLookApp {
             .frame(egui::Frame::default().fill(bg).inner_margin(0.0))
             .show(ctx, |ui| {
                 // A commit diff takes over the editor area while open.
-                if self.diff_view.is_some() {
+                if self.ws.diff_view.is_some() {
                     self.diff_area(ui);
                     return;
                 }
                 self.tab_bar(ui);
-                if self.search_open {
+                if self.ws.search_open {
                     self.search_bar(ui);
                 }
-                if self.active.is_none() {
+                if self.ws.active.is_none() {
                     self.welcome(ui);
                     return;
                 }
@@ -1791,9 +2053,13 @@ impl CodeLookApp {
 
     /// Render the open commit diff (header + unified diff body).
     fn diff_area(&mut self, ui: &mut egui::Ui) {
-        let Some(diff) = self.diff_view.take() else {
+        let Some(mut diff) = self.ws.diff_view.take() else {
             return;
         };
+        if diff.jobs_font != self.font_size {
+            diff.jobs = build_diff_jobs(&self.highlighter, &diff.file, &diff.lines, self.font_size);
+            diff.jobs_font = self.font_size;
+        }
         let mut keep = true;
 
         // Header bar: ◀ close · commit · file.
@@ -1822,12 +2088,12 @@ impl CodeLookApp {
         let font = FontId::monospace(self.font_size);
         let lh = crate::highlight::line_height(self.font_size);
         egui::ScrollArea::both()
-            .id_salt("diff_scroll")
+            .id_salt(("diff_scroll", self.ws.seq))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let full_w = ui.available_width();
-                for dl in &diff.lines {
+                for (li, dl) in diff.lines.iter().enumerate() {
                     let (rr, _) = ui.allocate_exact_size(Vec2::new(full_w.max(600.0), lh), Sense::hover());
                     let p = ui.painter();
                     let (bg_col, mark, mark_col, txt_col) = match dl.kind {
@@ -1880,18 +2146,29 @@ impl CodeLookApp {
                         font.clone(),
                         mark_col,
                     );
-                    p.text(
-                        egui::pos2(rr.left() + 112.0, rr.center().y),
-                        Align2::LEFT_CENTER,
-                        &dl.text,
-                        font.clone(),
-                        txt_col,
-                    );
+                    // Syntax-highlighted line when available (code rows);
+                    // hunk headers keep the plain colored text.
+                    match diff.jobs.get(li).and_then(|j| j.as_ref()) {
+                        Some(job) if !job.text.is_empty() => {
+                            let galley = ui.fonts(|f| f.layout_job(job.clone()));
+                            let y = rr.center().y - galley.size().y / 2.0;
+                            p.galley(egui::pos2(rr.left() + 112.0, y), galley, C_TEXT);
+                        }
+                        _ => {
+                            p.text(
+                                egui::pos2(rr.left() + 112.0, rr.center().y),
+                                Align2::LEFT_CENTER,
+                                &dl.text,
+                                font.clone(),
+                                txt_col,
+                            );
+                        }
+                    }
                 }
             });
 
         if keep {
-            self.diff_view = Some(diff);
+            self.ws.diff_view = Some(diff);
         }
     }
 
@@ -1903,21 +2180,21 @@ impl CodeLookApp {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("검색").color(C_TEXT_DIM).size(12.0));
                     let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.search_query)
+                        egui::TextEdit::singleline(&mut self.ws.search_query)
                             .hint_text("파일 내 검색")
                             .desired_width(260.0),
                     );
-                    if self.search_focus {
+                    if self.ws.search_focus {
                         resp.request_focus();
-                        self.search_focus = false;
+                        self.ws.search_focus = false;
                     }
                     if resp.changed() {
                         self.refresh_search();
                         // jump to first match
                         if let (Some(i), Some(line)) =
-                            (self.active, self.search_matches.first().copied())
+                            (self.ws.active, self.ws.search_matches.first().copied())
                         {
-                            self.tabs[i].scroll_to_line = Some(line);
+                            self.ws.tabs[i].scroll_to_line = Some(line);
                         }
                     }
                     let enter =
@@ -1925,7 +2202,7 @@ impl CodeLookApp {
                     let shift = ui.input(|i| i.modifiers.shift);
                     if enter {
                         self.search_step(!shift);
-                        self.search_focus = true; // keep focus for repeated Enter
+                        self.ws.search_focus = true; // keep focus for repeated Enter
                     }
                     if ui.small_button("▲").clicked() {
                         self.search_step(false);
@@ -1933,25 +2210,25 @@ impl CodeLookApp {
                     if ui.small_button("▼").clicked() {
                         self.search_step(true);
                     }
-                    let label = if self.search_matches.is_empty() {
-                        if self.search_query.is_empty() {
+                    let label = if self.ws.search_matches.is_empty() {
+                        if self.ws.search_query.is_empty() {
                             String::new()
                         } else {
                             "결과 없음".to_string()
                         }
                     } else {
-                        format!("{}/{}", self.search_cur + 1, self.search_matches.len())
+                        format!("{}/{}", self.ws.search_cur + 1, self.ws.search_matches.len())
                     };
                     ui.label(egui::RichText::new(label).weak());
                     if ui.small_button("✕").clicked() {
-                        self.search_open = false;
+                        self.ws.search_open = false;
                     }
                 });
             });
     }
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
-        if self.tabs.is_empty() {
+        if self.ws.tabs.is_empty() {
             return;
         }
         let mut close: Option<usize> = None;
@@ -1964,15 +2241,15 @@ impl CodeLookApp {
             .fill(C_PANEL)
             .show(ui, |ui| {
                 egui::ScrollArea::horizontal()
-                    .id_salt("tab_scroll")
+                    .id_salt(("tab_scroll", self.ws.seq))
                     .auto_shrink([false, false])
                     .max_height(TAB_H)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         ui.horizontal(|ui| {
-                            for i in 0..self.tabs.len() {
-                                let selected = self.active == Some(i);
-                                let name = self.tabs[i]
+                            for i in 0..self.ws.tabs.len() {
+                                let selected = self.ws.active == Some(i);
+                                let name = self.ws.tabs[i]
                                     .path
                                     .file_name()
                                     .unwrap_or_default()
@@ -2076,17 +2353,17 @@ impl CodeLookApp {
         }
 
         if let Some(i) = select {
-            self.active = Some(i);
+            self.ws.active = Some(i);
             self.refresh_search();
-            let (p, line) = (self.tabs[i].path.clone(), self.tabs[i].flash_line.unwrap_or(0));
+            let (p, line) = (self.ws.tabs[i].path.clone(), self.ws.tabs[i].flash_line.unwrap_or(0));
             self.record_nav(p, line);
         }
         if let Some(i) = close {
-            self.tabs.remove(i);
-            self.active = if self.tabs.is_empty() {
+            self.ws.tabs.remove(i);
+            self.ws.active = if self.ws.tabs.is_empty() {
                 None
             } else {
-                Some(self.active.unwrap_or(0).min(self.tabs.len() - 1))
+                Some(self.ws.active.unwrap_or(0).min(self.ws.tabs.len() - 1))
             };
             self.refresh_search();
         }
@@ -2124,8 +2401,8 @@ impl CodeLookApp {
     }
 
     fn editor(&mut self, ui: &mut egui::Ui, bg: Color32) {
-        let idx = match self.active {
-            Some(i) if i < self.tabs.len() => i,
+        let idx = match self.ws.active {
+            Some(i) if i < self.ws.tabs.len() => i,
             _ => return,
         };
 
@@ -2135,21 +2412,21 @@ impl CodeLookApp {
 
         // Build (or reuse cached) gutter + code width — only rebuilt on font change.
         let ctx = ui.ctx().clone();
-        self.tabs[idx].ensure_render(&ctx, self.font_size);
+        self.ws.tabs[idx].ensure_render(&ctx, self.font_size);
 
         // Layouter feeds the cached highlighted job to the TextEdit.
-        let job_for_layouter = self.tabs[idx].job.clone();
+        let job_for_layouter = self.ws.tabs[idx].job.clone();
         let mut layouter = move |ui: &egui::Ui, _buf: &str, _w: f32| {
             ui.fonts(|f| f.layout_job(job_for_layouter.clone()))
         };
 
-        let scroll_target = self.tabs[idx].scroll_to_line;
+        let scroll_target = self.ws.tabs[idx].scroll_to_line;
         let mut goto: Option<String> = None;
         let mut clear_scroll = false;
         let mut clicked_nothing = false;
 
         // Borrow the single tab so edit_buf / content can be touched independently.
-        let tab = &mut self.tabs[idx];
+        let tab = &mut self.ws.tabs[idx];
         let gutter_job = tab.gutter_job.clone();
         let code_w = tab.code_w;
 
@@ -2160,7 +2437,7 @@ impl CodeLookApp {
         let min_rows = ui.fonts(|f| (view_h / f.row_height(&font)).floor().max(1.0) as usize);
 
         egui::ScrollArea::both()
-            .id_salt("editor_scroll")
+            .id_salt(("editor_scroll", self.ws.seq))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 16.0;
@@ -2302,10 +2579,10 @@ impl CodeLookApp {
             });
 
         if clear_scroll {
-            self.tabs[idx].scroll_to_line = None;
+            self.ws.tabs[idx].scroll_to_line = None;
         }
         if clicked_nothing {
-            self.status = "⌘+클릭: 식별자 위에서 클릭하세요".to_string();
+            self.ws.status = "⌘+클릭: 식별자 위에서 클릭하세요".to_string();
         }
         if let Some(w) = goto {
             self.goto_definition(&w);
@@ -2540,6 +2817,64 @@ fn sep_dot(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(3.0, ui.available_height()), Sense::hover());
     ui.painter()
         .circle_filled(rect.center(), 1.5, C_TEXT_DIM.gamma_multiply(0.7));
+}
+
+/// One project tab in the top bar. Returns true when clicked (switch to it);
+/// sets `close_to` instead when its ✕ is clicked.
+fn project_chip(
+    ui: &mut egui::Ui,
+    seq: usize,
+    name: &str,
+    active: bool,
+    close_to: &mut Option<PathBuf>,
+    root: &Path,
+) -> bool {
+    let font = FontId::proportional(13.0);
+    let text_w = ui.fonts(|f| {
+        f.layout_no_wrap(name.to_string(), font.clone(), C_TEXT)
+            .size()
+            .x
+    });
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(text_w + 16.0 + 18.0, 24.0), Sense::click());
+    let p = ui.painter();
+    if active {
+        p.rect_filled(rect, 5.0, C_HOVER);
+    } else if resp.hovered() {
+        p.rect_filled(rect, 5.0, C_HOVER.gamma_multiply(0.55));
+    }
+    p.text(
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        name,
+        font,
+        if active { C_TEXT } else { C_TEXT_DIM },
+    );
+    if active {
+        p.hline(
+            egui::Rangef::new(rect.left() + 5.0, rect.right() - 5.0),
+            rect.bottom() - 1.0,
+            Stroke::new(2.0, C_ACCENT),
+        );
+    }
+    // Close ✕ with its own hit area (shown while the chip is hovered/active).
+    let cx = Rect::from_center_size(
+        egui::pos2(rect.right() - 11.0, rect.center().y),
+        Vec2::splat(14.0),
+    );
+    let cresp = ui.interact(cx, ui.id().with(("proj_close", seq)), Sense::click());
+    if active || resp.hovered() || cresp.hovered() {
+        draw_x(
+            ui.painter(),
+            cx.shrink(3.0),
+            if cresp.hovered() { C_TEXT } else { C_TEXT_DIM },
+        );
+    }
+    if cresp.clicked() {
+        *close_to = Some(root.to_path_buf());
+        return false;
+    }
+    resp.clicked()
 }
 
 /// IntelliJ-style tool-window header: a short uppercase title in a slim bar,

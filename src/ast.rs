@@ -16,6 +16,7 @@ pub enum Lang {
     Python,
     JavaScript,
     TypeScript,
+    Tsx,
     Java,
     Kotlin,
     Go,
@@ -86,7 +87,8 @@ impl Lang {
             "rs" => Lang::Rust,
             "py" | "pyi" => Lang::Python,
             "js" | "mjs" | "cjs" | "jsx" => Lang::JavaScript,
-            "ts" | "tsx" => Lang::TypeScript,
+            "ts" | "mts" | "cts" => Lang::TypeScript,
+            "tsx" => Lang::Tsx,
             "java" => Lang::Java,
             "kt" | "kts" => Lang::Kotlin,
             "go" => Lang::Go,
@@ -101,6 +103,7 @@ impl Lang {
             Lang::Python => "Python",
             Lang::JavaScript => "JavaScript",
             Lang::TypeScript => "TypeScript",
+            Lang::Tsx => "TSX",
             Lang::Java => "Java",
             Lang::Kotlin => "Kotlin",
             Lang::Go => "Go",
@@ -112,7 +115,9 @@ impl Lang {
         match self {
             Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
             Lang::Python => tree_sitter_python::LANGUAGE.into(),
-            Lang::JavaScript | Lang::TypeScript => tree_sitter_javascript::LANGUAGE.into(),
+            Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Lang::Java => tree_sitter_java::LANGUAGE.into(),
             Lang::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
             Lang::Go => tree_sitter_go::LANGUAGE.into(),
@@ -210,12 +215,30 @@ fn def_of(node: &Node, lang: Lang, src: &[u8]) -> Option<(SymKind, String)> {
             "class_definition" => Class,
             _ => return None,
         },
-        JavaScript | TypeScript => match k {
+        JavaScript | TypeScript | Tsx => match k {
             "function_declaration" | "generator_function_declaration" => Function,
-            "class_declaration" => Class,
-            "method_definition" => Method,
+            "class_declaration" | "abstract_class_declaration" => Class,
+            "method_definition" | "method_signature" => Method,
             "interface_declaration" => Interface,
             "enum_declaration" => Enum,
+            "type_alias_declaration" => Type,
+            // `const App = () => …` / `const f = function …` — the dominant
+            // way frontend code defines components and functions.
+            "variable_declarator" => {
+                let is_fn = node
+                    .child_by_field_name("value")
+                    .map(|v| {
+                        matches!(
+                            v.kind(),
+                            "arrow_function" | "function_expression" | "generator_function"
+                        )
+                    })
+                    .unwrap_or(false);
+                if !is_fn {
+                    return None;
+                }
+                Function
+            }
             _ => return None,
         },
         Java => match k {
@@ -299,6 +322,24 @@ mod tests {
             "class Foo {\n  void bar() {}\n}\ninterface I {}\nenum E { A, B }",
         );
         for want in ["Foo", "bar", "I", "E"] {
+            assert!(n.iter().any(|x| x == want), "missing {want} in {n:?}");
+        }
+    }
+
+    #[test]
+    fn typescript_and_tsx_symbols() {
+        let n = names(
+            Lang::TypeScript,
+            "interface P { n: number }\ntype A = string\nenum E { X }\nfunction f() {}\nconst g = () => 1\nclass C { m() {} }",
+        );
+        for want in ["P", "A", "E", "f", "g", "C", "m"] {
+            assert!(n.iter().any(|x| x == want), "missing {want} in {n:?}");
+        }
+        let n = names(
+            Lang::Tsx,
+            "const App = (p: {n: number}) => <div>{p.n}</div>\nexport function Page() { return <App n={1} /> }",
+        );
+        for want in ["App", "Page"] {
             assert!(n.iter().any(|x| x == want), "missing {want} in {n:?}");
         }
     }

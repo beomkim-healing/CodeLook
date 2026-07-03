@@ -130,31 +130,54 @@ fn color_for(name: &str) -> (Color32, bool) {
 
 /// Build a tree-sitter highlight configuration for a language, if supported.
 pub fn ts_config(lang: Lang) -> Option<HighlightConfiguration> {
-    let (language, query): (tree_sitter::Language, &str) = match lang {
+    // TS/TSX highlight queries "inherit" the JavaScript ones upstream, so the
+    // JS (and JSX) queries are prepended manually — tree-sitter-highlight
+    // doesn't process `; inherits:` comments.
+    let ts_query = || {
+        format!(
+            "{}\n{}",
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+        )
+    };
+    let tsx_query = || {
+        format!(
+            "{}\n{}\n{}",
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+        )
+    };
+    let (language, query): (tree_sitter::Language, std::borrow::Cow<'_, str>) = match lang {
         Lang::Rust => (
             tree_sitter_rust::LANGUAGE.into(),
-            tree_sitter_rust::HIGHLIGHTS_QUERY,
+            tree_sitter_rust::HIGHLIGHTS_QUERY.into(),
         ),
         Lang::Python => (
             tree_sitter_python::LANGUAGE.into(),
-            tree_sitter_python::HIGHLIGHTS_QUERY,
+            tree_sitter_python::HIGHLIGHTS_QUERY.into(),
         ),
-        Lang::JavaScript | Lang::TypeScript => (
+        Lang::JavaScript => (
             tree_sitter_javascript::LANGUAGE.into(),
-            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_javascript::HIGHLIGHT_QUERY.into(),
         ),
+        Lang::TypeScript => (
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ts_query().into(),
+        ),
+        Lang::Tsx => (tree_sitter_typescript::LANGUAGE_TSX.into(), tsx_query().into()),
         Lang::Java => (
             tree_sitter_java::LANGUAGE.into(),
-            tree_sitter_java::HIGHLIGHTS_QUERY,
+            tree_sitter_java::HIGHLIGHTS_QUERY.into(),
         ),
         Lang::Go => (
             tree_sitter_go::LANGUAGE.into(),
-            tree_sitter_go::HIGHLIGHTS_QUERY,
+            tree_sitter_go::HIGHLIGHTS_QUERY.into(),
         ),
-        Lang::Kotlin => (tree_sitter_kotlin_ng::LANGUAGE.into(), KOTLIN_HIGHLIGHTS),
+        Lang::Kotlin => (tree_sitter_kotlin_ng::LANGUAGE.into(), KOTLIN_HIGHLIGHTS.into()),
         Lang::Json => return None, // syntect handles JSON well
     };
-    let mut cfg = HighlightConfiguration::new(language, lang.label(), query, "", "").ok()?;
+    let mut cfg = HighlightConfiguration::new(language, lang.label(), &query, "", "").ok()?;
     cfg.configure(HIGHLIGHT_NAMES);
     Some(cfg)
 }
@@ -316,6 +339,16 @@ mod tests {
     fn rust_and_java_colored() {
         assert!(ts_colors("a.rs", "fn main() { let n = 42; /* c */ }") >= 4);
         assert!(ts_colors("A.java", "class A { void m() { int n = 42; } }") >= 4);
+    }
+
+    #[test]
+    fn typescript_and_tsx_colored() {
+        // TS-specific syntax (interface / type annotations / generics) must
+        // parse — this used to run through the JavaScript grammar and break.
+        let ts = "interface Props { id: number }\ntype Alias = string | null\nconst f = (p: Props): Alias => `x${p.id}` // c\n";
+        assert!(ts_colors("a.ts", ts) >= 4, "TS tokens not colored");
+        let tsx = "interface P { n: number }\nexport function App(p: P) {\n  return <div className=\"a\">{p.n}</div>\n}\n";
+        assert!(ts_colors("a.tsx", tsx) >= 4, "TSX tokens not colored");
     }
 
 }
