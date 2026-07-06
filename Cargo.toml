@@ -28,6 +28,7 @@ tree-sitter-highlight = "0.26.9"
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 png = "0.17"
 tree-sitter-typescript = "0.23.2"
+muda = "0.19.3"
 
 [features]
 # Build with `--features shot` to enable `--shot <out.png>` capture mode

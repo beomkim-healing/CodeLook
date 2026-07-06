@@ -96,27 +96,6 @@ pub fn build_index(root: &Path) -> (SymbolIndex, Vec<PathBuf>) {
     (index, files)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn docs_are_not_indexed() {
-        let dir = std::env::temp_dir().join(format!("codelook_sym_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("real.kt"), "class FooBarBaz {}\n").unwrap();
-        std::fs::write(
-            dir.join("doc.md"),
-            "예시:\n```kotlin\nclass FooBarBaz {}\n```\n",
-        )
-        .unwrap();
-        let (index, _files) = build_index(&dir);
-        let locs = index.get("FooBarBaz").expect("kt definition indexed");
-        assert!(locs.iter().all(|l| l.path.extension().unwrap() == "kt"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
-
 fn scan(path: &Path, content: &str, patterns: &[Regex], index: &mut SymbolIndex) {
     for (lineno, line) in content.lines().enumerate() {
         // Cheap skip for obvious noise.
@@ -136,5 +115,26 @@ fn scan(path: &Path, content: &str, patterns: &[Regex], index: &mut SymbolIndex)
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docs_are_not_indexed() {
+        let dir = std::env::temp_dir().join(format!("codelook_sym_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("real.kt"), "class FooBarBaz {}\n").unwrap();
+        std::fs::write(
+            dir.join("doc.md"),
+            "예시:\n```kotlin\nclass FooBarBaz {}\n```\n",
+        )
+        .unwrap();
+        let (index, _files) = build_index(&dir);
+        let locs = index.get("FooBarBaz").expect("kt definition indexed");
+        assert!(locs.iter().all(|l| l.path.extension().unwrap() == "kt"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -6,6 +6,7 @@ mod git;
 mod highlight;
 mod icons;
 mod keymap;
+mod review;
 mod search;
 mod symbols;
 
@@ -21,6 +22,7 @@ pub struct ShotConfig {
     pub open: Option<PathBuf>,
     pub gsearch: Option<String>,
     pub log: bool,
+    pub pr: Option<u64>,
 }
 
 fn main() -> eframe::Result<()> {
@@ -29,15 +31,17 @@ fn main() -> eframe::Result<()> {
     let mut shot: Option<ShotConfig> = None;
     let mut open_file: Option<PathBuf> = None;
     let mut gsearch: Option<String> = None;
+    let mut pr: Option<u64> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
             "--shot" => {
                 let out = args.next().map(PathBuf::from).unwrap_or_default();
-                shot = Some(ShotConfig { out, open: None, gsearch: None, log: false });
+                shot = Some(ShotConfig { out, open: None, gsearch: None, log: false, pr: None });
             }
             "--open" => open_file = args.next().map(PathBuf::from),
             "--gsearch" => gsearch = args.next(),
+            "--pr" => pr = args.next().and_then(|s| s.parse().ok()),
             "--log" => {
                 if let Some(s) = shot.as_mut() {
                     s.log = true;
@@ -54,6 +58,7 @@ fn main() -> eframe::Result<()> {
     if let Some(s) = shot.as_mut() {
         s.open = open_file;
         s.gsearch = gsearch;
+        s.pr = pr;
     }
 
     let native_options = eframe::NativeOptions {
@@ -71,6 +76,7 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app::CodeLookApp::new(
                 cc,
                 initial_path.clone(),
+                pr,
                 shot.clone(),
             )))
         }),

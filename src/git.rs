@@ -96,7 +96,7 @@ pub fn commit_log(root: &Path, limit: usize) -> Vec<CommitInfo> {
     out
 }
 
-fn delta_status(s: git2::Delta) -> FileStatus {
+pub(crate) fn delta_status(s: git2::Delta) -> FileStatus {
     use git2::Delta;
     match s {
         Delta::Added | Delta::Copied => FileStatus::Added,
@@ -164,6 +164,30 @@ pub fn commit_file_diff(root: &Path, commit_id: &str, file: &str) -> Vec<DiffLin
     let Ok(diff) =
         repo.diff_tree_to_tree(parent_tree.as_ref(), tree.as_ref(), Some(&mut opts))
     else {
+        return Vec::new();
+    };
+    collect_diff_lines(&diff)
+}
+
+/// Unified diff of one `file` between two arbitrary commits (PR review:
+/// merge-base vs head).
+pub fn range_file_diff(root: &Path, base_id: &str, head_id: &str, file: &str) -> Vec<DiffLine> {
+    let Ok(repo) = Repository::discover(root) else {
+        return Vec::new();
+    };
+    let tree_of = |id: &str| {
+        git2::Oid::from_str(id)
+            .ok()
+            .and_then(|oid| repo.find_commit(oid).ok())
+            .and_then(|c| c.tree().ok())
+    };
+    let (Some(base), Some(head)) = (tree_of(base_id), tree_of(head_id)) else {
+        return Vec::new();
+    };
+    let mut opts = DiffOptions::new();
+    opts.pathspec(file);
+    opts.context_lines(3);
+    let Ok(diff) = repo.diff_tree_to_tree(Some(&base), Some(&head), Some(&mut opts)) else {
         return Vec::new();
     };
     collect_diff_lines(&diff)
@@ -324,6 +348,21 @@ pub fn ahead_behind(root: &Path) -> Option<(usize, usize)> {
     let upstream = branch.upstream().ok()?;
     let up = upstream.get().target()?;
     repo.graph_ahead_behind(local, up).ok()
+}
+
+/// Root of the MAIN working tree for `root`'s repository. For a linked
+/// worktree (e.g. a CodeLook PR-review worktree) this is the original
+/// checkout; for the main tree it's just its own root.
+pub fn main_worktree_root(root: &Path) -> Option<PathBuf> {
+    // --git-common-dir is the main repo's .git even from a linked worktree
+    // (relative ".git" from the main tree itself).
+    let (ok, out) = run_git(root, &["rev-parse".into(), "--git-common-dir".into()]);
+    if !ok {
+        return None;
+    }
+    let p = PathBuf::from(out.lines().next()?.trim());
+    let p = if p.is_absolute() { p } else { root.join(p) };
+    p.canonicalize().ok()?.parent().map(|x| x.to_path_buf())
 }
 
 /// Current branch (or short commit hash when detached), if inside a repo.

@@ -17,6 +17,8 @@ pub enum Action {
     GoToDeclaration,
     Back,
     Forward,
+    NextChange,
+    PrevChange,
     ToggleProject,
     ToggleStructure,
     ToggleCommits,
@@ -38,6 +40,8 @@ pub const ACTIONS: &[Action] = &[
     Action::GoToDeclaration,
     Action::Back,
     Action::Forward,
+    Action::NextChange,
+    Action::PrevChange,
     Action::CloseTab,
     Action::PrevTab,
     Action::NextTab,
@@ -60,6 +64,8 @@ impl Action {
             Action::GoToDeclaration => "정의로 이동 (Go to Declaration)",
             Action::Back => "뒤로 가기",
             Action::Forward => "앞으로 가기",
+            Action::NextChange => "다음 변경으로 (리뷰/변경 파일)",
+            Action::PrevChange => "이전 변경으로 (리뷰/변경 파일)",
             Action::ToggleProject => "프로젝트 패널 토글",
             Action::ToggleStructure => "구조 패널 토글",
             Action::ToggleCommits => "커밋 패널 토글",
@@ -82,6 +88,8 @@ impl Action {
             Action::GoToDeclaration => "go_to_declaration",
             Action::Back => "back",
             Action::Forward => "forward",
+            Action::NextChange => "next_change",
+            Action::PrevChange => "prev_change",
             Action::ToggleProject => "toggle_project",
             Action::ToggleStructure => "toggle_structure",
             Action::ToggleCommits => "toggle_commits",
@@ -97,6 +105,7 @@ impl Action {
         let cmd = Modifiers::COMMAND;
         let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
         let cmd_alt = Modifiers::COMMAND | Modifiers::ALT;
+        let ctrl_alt = Modifiers::CTRL | Modifiers::ALT;
         match self {
             Action::FindInFile => Chord::new(cmd, Key::F),
             Action::FindInProject => Chord::new(cmd_shift, Key::F),
@@ -107,6 +116,8 @@ impl Action {
             Action::GoToDeclaration => Chord::new(cmd, Key::B),
             Action::Back => Chord::new(cmd, Key::OpenBracket),
             Action::Forward => Chord::new(cmd, Key::CloseBracket),
+            Action::NextChange => Chord::new(ctrl_alt, Key::ArrowDown),
+            Action::PrevChange => Chord::new(ctrl_alt, Key::ArrowUp),
             Action::ToggleProject => Chord::new(cmd, Key::Num1),
             Action::ToggleStructure => Chord::new(cmd, Key::Num7),
             Action::ToggleCommits => Chord::new(cmd, Key::Num9),
@@ -183,6 +194,16 @@ impl Chord {
     }
 }
 
+/// Exact modifier equality with cmd/mac_cmd folded together (macOS keymap).
+fn mods_eq(pressed: Modifiers, pattern: Modifiers) -> bool {
+    let cmd_p = pressed.command || pressed.mac_cmd;
+    let cmd_q = pattern.command || pattern.mac_cmd;
+    pressed.alt == pattern.alt
+        && pressed.shift == pattern.shift
+        && pressed.ctrl == pattern.ctrl
+        && cmd_p == cmd_q
+}
+
 pub struct Keymap {
     map: std::collections::HashMap<Action, Chord>,
 }
@@ -221,9 +242,33 @@ impl Keymap {
 
     /// True once per press of the action's chord; consumes the key event so
     /// it doesn't also reach focused widgets.
+    ///
+    /// Matching is EXACT on modifiers — egui's `consume_key` uses
+    /// `matches_logically`, which ignores extra pressed shift/alt, so ⌘F
+    /// would swallow ⇧⌘F depending on check order.
     pub fn pressed(&self, ctx: &Context, a: Action) -> bool {
         let c = self.get(a);
-        ctx.input_mut(|i| i.consume_key(c.mods, c.key))
+        ctx.input_mut(|i| {
+            let mut found = false;
+            i.events.retain(|e| {
+                if !found {
+                    if let eframe::egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = e
+                    {
+                        if *key == c.key && mods_eq(*modifiers, c.mods) {
+                            found = true;
+                            return false; // consume the event
+                        }
+                    }
+                }
+                true
+            });
+            found
+        })
     }
 
     pub fn text(&self, a: Action) -> String {
@@ -271,6 +316,23 @@ mod tests {
         assert!(restored.get(Action::FindInFile).mods.shift);
         // Untouched actions keep defaults.
         assert_eq!(restored.get(Action::Back).key, Key::OpenBracket);
+    }
+
+    #[test]
+    fn exact_modifier_matching() {
+        // ⇧⌘F must NOT satisfy the plain ⌘F pattern (and vice versa).
+        let cmd = Modifiers::COMMAND;
+        let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        assert!(!mods_eq(cmd_shift, cmd));
+        assert!(!mods_eq(cmd, cmd_shift));
+        assert!(mods_eq(cmd_shift, cmd_shift));
+        // mac_cmd and command are the same logical key.
+        let mac = Modifiers {
+            mac_cmd: true,
+            command: true,
+            ..Default::default()
+        };
+        assert!(mods_eq(mac, cmd));
     }
 
     #[test]

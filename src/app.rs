@@ -80,8 +80,12 @@ struct Tab {
     last_cursor_ci: Option<usize>,
     lang: Option<ast::Lang>,
     outline: Vec<DocSymbol>,
-    /// Per-line changes vs HEAD, for the gutter change bars.
+    /// Per-line changes vs HEAD, for the gutter change bars. In a review tab
+    /// this instead holds the PR's base…head overlay.
     git_changes: crate::git::FileDiff,
+    /// PR-review tab: content comes from the PR head commit (not disk) and
+    /// `git_changes` lines are painted as full-width change bands.
+    is_review: bool,
 }
 
 impl Tab {
@@ -112,6 +116,7 @@ impl Tab {
             lang,
             outline,
             git_changes: crate::git::FileDiff::default(),
+            is_review: false,
         }
     }
 
@@ -328,6 +333,7 @@ fn split_job_lines(doc: &str, job: &LayoutJob) -> Vec<LayoutJob> {
 enum LeftView {
     Project,
     Commit,
+    Review,
 }
 
 /// Single status letter for changed-file lists.
@@ -466,6 +472,19 @@ pub struct Workspace {
     commit_files: Vec<crate::git::FileChange>,
     commit_files_for: String,
     diff_view: Option<DiffView>,
+    // PR review session (left REVIEW panel + editor overlays).
+    review: Option<crate::review::ReviewSession>,
+    review_rx: Option<Receiver<Result<crate::review::ReviewSession, String>>>,
+    review_input: String,
+    review_err: Option<String>,
+    /// Start reviews in a dedicated worktree (whole project = PR state).
+    review_worktree: bool,
+    // Open-PR picker (REVIEW panel, before a session starts).
+    pr_list: Vec<crate::review::PrListItem>,
+    pr_list_rx: Option<Receiver<Result<Vec<crate::review::PrListItem>, String>>>,
+    pr_list_err: Option<String>,
+    /// Only PRs whose review is requested from me (default) vs all open PRs.
+    pr_list_mine: bool,
 }
 
 impl Workspace {
@@ -541,6 +560,15 @@ impl Workspace {
             commit_files: Vec::new(),
             commit_files_for: String::new(),
             diff_view: None,
+            review: None,
+            review_rx: None,
+            review_input: String::new(),
+            review_err: None,
+            review_worktree: true,
+            pr_list: Vec::new(),
+            pr_list_rx: None,
+            pr_list_err: None,
+            pr_list_mine: true,
         }
     }
 
@@ -578,12 +606,18 @@ pub struct CodeLookApp {
     // Capture mode (design-review loop); None in normal use.
     shot: Option<crate::ShotConfig>,
     shot_frame: u32,
+    /// Native macOS menu bar — kept alive for the app's lifetime.
+    _menu: Option<muda::Menu>,
+    /// In-flight PR review worktree creation → (worktree path, PR number).
+    /// App-level: completion opens a NEW project workspace.
+    worktree_rx: Option<Receiver<Result<(PathBuf, u64), String>>>,
 }
 
 impl CodeLookApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         initial: Option<PathBuf>,
+        pr: Option<u64>,
         shot: Option<crate::ShotConfig>,
     ) -> Self {
         setup_fonts(&cc.egui_ctx);
@@ -621,7 +655,18 @@ impl CodeLookApp {
             icons: icons::IconSet::new(&cc.egui_ctx),
             shot,
             shot_frame: 0,
+            _menu: None,
+            worktree_rx: None,
         };
+
+        // Native macOS menu bar (open / search / zoom / settings live there,
+        // not in the toolbar). Skipped in capture mode.
+        #[cfg(target_os = "macos")]
+        if app.shot.is_none() {
+            let menu = app.build_menu();
+            menu.init_for_nsapp();
+            app._menu = Some(menu);
+        }
 
         // In capture mode, open the requested project + file deterministically
         // (ignore any restored session).
@@ -676,6 +721,33 @@ impl CodeLookApp {
                     }
                 }
             }
+            // PR review session, loaded synchronously for the screenshot.
+            // `--pr 0` shows the empty REVIEW panel with the open-PR picker.
+            if let (Some(n), Some(root)) = (s.pr, app.ws.project_root.clone()) {
+                if n == 0 {
+                    app.left_view = LeftView::Review;
+                    app.ws.pr_list =
+                        crate::review::list_prs(&root, app.ws.pr_list_mine).unwrap_or_default();
+                }
+            }
+            if let (Some(n), Some(root)) = (s.pr.filter(|&n| n > 0), app.ws.project_root.clone()) {
+                match crate::review::load(&root, n) {
+                    Ok(sess) => {
+                        app.ws.review = Some(sess);
+                        app.left_view = LeftView::Review;
+                        // Open the first modified file with its overlay.
+                        if let Some(i) = app
+                            .ws
+                            .review
+                            .as_ref()
+                            .and_then(|s| s.files.iter().position(|f| !f.overlay.changed.is_empty()))
+                        {
+                            app.open_review_file(i);
+                        }
+                    }
+                    Err(e) => app.ws.review_err = Some(e),
+                }
+            }
             // Populate the global-search popup synchronously for the screenshot.
             if let (Some(q), Some(root)) = (&s.gsearch, app.ws.project_root.clone()) {
                 let (hits, tr) = crate::search::global_search(&root, q);
@@ -698,6 +770,15 @@ impl CodeLookApp {
             }
             if let Some(p) = restored {
                 app.open_project(&cc.egui_ctx, p);
+            }
+        }
+        // `--pr N`: start a review right away — in a dedicated worktree, so
+        // the whole opened project ends up at the PR state.
+        if let Some(n) = pr {
+            if app.ws.project_root.is_some() {
+                app.left_view = LeftView::Review;
+                app.tree_open = true;
+                app.start_review_worktree(&cc.egui_ctx, n);
             }
         }
         app
@@ -849,11 +930,24 @@ impl CodeLookApp {
         self.ws.recent.retain(|p| p != &path);
         self.ws.recent.insert(0, path.clone());
         self.ws.recent.truncate(30);
-        if let Some(i) = self.ws.tabs.iter().position(|t| t.path == path) {
+        // Prefer a regular (disk) tab; fall back to a review tab of the same
+        // path so Back/Forward through review locations doesn't duplicate tabs.
+        if let Some(i) = self
+            .ws
+            .tabs
+            .iter()
+            .position(|t| t.path == path && !t.is_review)
+            .or_else(|| self.ws.tabs.iter().position(|t| t.path == path))
+        {
             self.ws.active = Some(i);
             self.ws.diff_view = None; // an open diff would keep covering the editor
             return;
         }
+        self.open_tab_from_disk(path);
+    }
+
+    /// Read `path` from disk into a new active tab; false when unreadable.
+    fn open_tab_from_disk(&mut self, path: PathBuf) -> bool {
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 self.ws.diff_view = None;
@@ -876,13 +970,60 @@ impl CodeLookApp {
                 self.ws.active = Some(self.ws.tabs.len() - 1);
                 self.ws.status.clear();
                 self.refresh_search();
+                true
             }
             Err(_) => {
                 self.ws.status = format!(
                     "열 수 없는 파일(바이너리 또는 권한): {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
                 );
+                false
             }
+        }
+    }
+
+    /// Open the on-disk (working-tree) version of a file at a line — never
+    /// matches a review tab, so it always shows what's actually on disk.
+    fn open_disk_file(&mut self, path: PathBuf, line: usize) {
+        self.record_origin();
+        if let Some(i) = self
+            .ws
+            .tabs
+            .iter()
+            .position(|t| !t.is_review && t.path == path)
+        {
+            self.ws.active = Some(i);
+            self.ws.diff_view = None;
+        } else {
+            self.ws.diff_view = None;
+            if !self.open_tab_from_disk(path.clone()) {
+                return;
+            }
+        }
+        self.set_jump_target(line);
+        self.record_nav(path, line);
+    }
+
+    /// From a review tab, jump to the file the PR is actually changing: the
+    /// same path (and line) in the MAIN working tree. Reviewing in a
+    /// worktree, this switches to the original project's workspace.
+    fn open_source_file(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.ws.project_root.clone() else {
+            return;
+        };
+        let Some(t) = self.ws.active.and_then(|i| self.ws.tabs.get(i)) else {
+            return;
+        };
+        let line = t.caret_line.or(t.flash_line).unwrap_or(0);
+        let Ok(rel) = t.path.strip_prefix(&root).map(|p| p.to_path_buf()) else {
+            return;
+        };
+        match crate::git::main_worktree_root(&root) {
+            Some(main) if main != root => {
+                self.open_project(ctx, main.clone());
+                self.open_disk_file(main.join(&rel), line);
+            }
+            _ => self.open_disk_file(root.join(&rel), line),
         }
     }
 
@@ -1134,6 +1275,92 @@ impl CodeLookApp {
         }
     }
 
+    // ---- Native macOS menu bar ----------------------------------------------
+
+    /// Build the menu bar. Shortcut hints are shown in the labels (functional
+    /// key handling stays in the in-app keymap, so rebinding keeps working).
+    fn build_menu(&self) -> muda::Menu {
+        use crate::keymap::Action as A;
+        use muda::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+        let item = |id: &str, label: &str, a: Option<A>| {
+            let text = match a {
+                Some(a) => format!("{label}   {}", self.keymap.text(a)),
+                None => label.to_string(),
+            };
+            MenuItem::with_id(id, text, true, None)
+        };
+
+        let menu = Menu::new();
+        let app_m = Submenu::new("CodeLook", true);
+        let _ = app_m.append_items(&[
+            &item("settings", "설정 · 단축키…", None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::quit(Some("CodeLook 종료")),
+        ]);
+        let file_m = Submenu::new("파일", true);
+        let _ = file_m.append_items(&[
+            &item("open_project", "프로젝트 열기…", None),
+            &PredefinedMenuItem::separator(),
+            &item("close_tab", "탭 닫기", Some(A::CloseTab)),
+        ]);
+        let find_m = Submenu::new("이동 / 검색", true);
+        let _ = find_m.append_items(&[
+            &item("find_in_file", "파일 내 검색", Some(A::FindInFile)),
+            &item("find_in_project", "전체 검색 (Find in Files)", Some(A::FindInProject)),
+            &PredefinedMenuItem::separator(),
+            &item("go_to_file", "파일로 이동", Some(A::GoToFile)),
+            &item("go_to_symbol", "심볼로 이동", Some(A::GoToSymbol)),
+            &item("recent_files", "최근 파일", Some(A::RecentFiles)),
+            &item("go_to_line", "줄로 이동", Some(A::GoToLine)),
+        ]);
+        let view_m = Submenu::new("보기", true);
+        let _ = view_m.append_items(&[
+            &item("zoom_in", "글자 크게", Some(A::ZoomIn)),
+            &item("zoom_out", "글자 작게", Some(A::ZoomOut)),
+        ]);
+        let _ = menu.append_items(&[&app_m, &file_m, &find_m, &view_m]);
+        menu
+    }
+
+    /// Handle clicks coming from the native menu bar.
+    fn poll_menu(&mut self, ctx: &egui::Context) {
+        while let Ok(ev) = muda::MenuEvent::receiver().try_recv() {
+            match ev.id().as_ref() {
+                "settings" => self.settings_open = true,
+                "open_project" => {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        self.open_project(ctx, dir);
+                    }
+                }
+                "close_tab" => self.close_active_tab(),
+                "find_in_file" => {
+                    if self.ws.active.is_some() {
+                        self.ws.search_open = true;
+                        self.ws.search_focus = true;
+                    }
+                }
+                "find_in_project" => {
+                    if self.ws.project_root.is_some() {
+                        self.ws.gsearch_open = true;
+                        self.ws.gsearch_focus = true;
+                        self.gsearch_warm(ctx);
+                    }
+                }
+                "go_to_file" => self.open_finder(FinderMode::File),
+                "go_to_symbol" => self.open_finder(FinderMode::Symbol),
+                "recent_files" => self.open_finder(FinderMode::Recent),
+                "go_to_line" => {
+                    if self.ws.active.is_some() {
+                        self.open_finder(FinderMode::Line);
+                    }
+                }
+                "zoom_in" => self.zoom(1.0),
+                "zoom_out" => self.zoom(-1.0),
+                _ => {}
+            }
+        }
+    }
+
     // ---- Keyboard shortcuts (configurable, see keymap.rs) -------------------
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -1169,7 +1396,13 @@ impl CodeLookApp {
             self.nav_forward();
         }
         if self.keymap.pressed(ctx, A::ToggleProject) {
-            self.tree_open = !self.tree_open;
+            // ⌘1 focuses/collapses the Project view specifically.
+            if self.tree_open && self.left_view == LeftView::Project {
+                self.tree_open = false;
+            } else {
+                self.left_view = LeftView::Project;
+                self.tree_open = true;
+            }
         }
         if self.keymap.pressed(ctx, A::ToggleStructure) {
             self.structure_open = !self.structure_open;
@@ -1191,6 +1424,12 @@ impl CodeLookApp {
         }
         if self.keymap.pressed(ctx, A::ZoomOut) {
             self.zoom(-1.0);
+        }
+        if self.keymap.pressed(ctx, A::NextChange) {
+            self.jump_change(1);
+        }
+        if self.keymap.pressed(ctx, A::PrevChange) {
+            self.jump_change(-1);
         }
     }
 
@@ -1625,6 +1864,11 @@ impl CodeLookApp {
         let active_path = self.ws.active.and_then(|i| self.ws.tabs.get(i)).map(|t| t.path.clone());
         let mut rebuilt = Vec::with_capacity(self.ws.tabs.len());
         for tab in self.ws.tabs.drain(..) {
+            if tab.is_review {
+                // Review tabs read from the PR head commit — disk is irrelevant.
+                rebuilt.push(tab);
+                continue;
+            }
             match std::fs::read_to_string(&tab.path) {
                 Ok(content) if content != tab.content => {
                     let job = self.highlighter.highlight(
@@ -1918,10 +2162,28 @@ impl CodeLookApp {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         let filt = self.ws.branch_filter.to_lowercase();
-                        for b in &self.ws.branches {
-                            if !filt.is_empty() && !b.name.to_lowercase().contains(&filt) {
-                                continue;
-                            }
+                        let matches = |b: &&crate::git::BranchInfo| {
+                            filt.is_empty() || b.name.to_lowercase().contains(&filt)
+                        };
+                        let locals: Vec<_> =
+                            self.ws.branches.iter().filter(|b| !b.is_remote).filter(matches).collect();
+                        let remotes: Vec<_> =
+                            self.ws.branches.iter().filter(|b| b.is_remote).filter(matches).collect();
+
+                        let section = |ui: &mut egui::Ui, title: &str| {
+                            let (hr, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 22.0),
+                                Sense::hover(),
+                            );
+                            ui.painter().text(
+                                egui::pos2(hr.left() + 8.0, hr.center().y + 2.0),
+                                Align2::LEFT_CENTER,
+                                title,
+                                FontId::proportional(10.5),
+                                C_HEADER,
+                            );
+                        };
+                        let mut row = |ui: &mut egui::Ui, b: &crate::git::BranchInfo| {
                             let (rr, rresp) = ui.allocate_exact_size(
                                 Vec2::new(ui.available_width(), 24.0),
                                 Sense::click(),
@@ -1934,34 +2196,41 @@ impl CodeLookApp {
                             }
                             draw_branch_icon(
                                 p,
-                                egui::pos2(rr.left() + 12.0, rr.center().y),
+                                egui::pos2(rr.left() + 16.0, rr.center().y),
                                 if b.is_current { C_ACCENT } else { C_TEXT_DIM },
                             );
                             p.text(
-                                egui::pos2(rr.left() + 24.0, rr.center().y),
+                                egui::pos2(rr.left() + 28.0, rr.center().y),
                                 Align2::LEFT_CENTER,
                                 &b.name,
                                 FontId::proportional(13.0),
-                                if b.is_current {
-                                    Color32::WHITE
-                                } else if b.is_remote {
-                                    C_TEXT_DIM
-                                } else {
-                                    C_TEXT
-                                },
+                                if b.is_current { Color32::WHITE } else { C_TEXT },
                             );
-                            if b.is_remote {
-                                p.text(
-                                    egui::pos2(rr.right() - 8.0, rr.center().y),
-                                    Align2::RIGHT_CENTER,
-                                    "remote",
-                                    FontId::proportional(11.0),
-                                    C_TEXT_DIM,
-                                );
-                            }
                             if rresp.clicked() && !b.is_current && !op_running {
                                 checkout = Some(b.name.clone());
                             }
+                        };
+
+                        if !locals.is_empty() {
+                            section(ui, "LOCAL");
+                            for b in &locals {
+                                row(ui, b);
+                            }
+                        }
+                        if !remotes.is_empty() {
+                            ui.add_space(4.0);
+                            section(ui, "REMOTE");
+                            for b in &remotes {
+                                row(ui, b);
+                            }
+                        }
+                        if locals.is_empty() && remotes.is_empty() {
+                            ui.add_space(14.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new("일치하는 브랜치 없음").color(C_TEXT_DIM),
+                                );
+                            });
                         }
                     });
             });
@@ -2049,6 +2318,189 @@ impl CodeLookApp {
                 jobs_font: self.font_size,
             });
         }
+    }
+
+    // ---- PR review -----------------------------------------------------
+
+    /// Load a PR review session in the background (fetch + diff — the
+    /// working tree is never touched).
+    fn start_review(&mut self, ctx: &egui::Context, number: u64) {
+        if self.ws.review_rx.is_some() {
+            return;
+        }
+        let Some(root) = self.ws.project_root.clone() else {
+            return;
+        };
+        self.ws.review_err = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::review::load(&root, number));
+            c.request_repaint();
+        });
+        self.ws.review_rx = Some(rx);
+        self.ws.status = format!("PR #{number} 불러오는 중…");
+    }
+
+    /// Fetch the open-PR list for the REVIEW panel picker (background, gh CLI).
+    fn kick_pr_list(&mut self, ctx: &egui::Context) {
+        if self.ws.pr_list_rx.is_some() {
+            return;
+        }
+        let Some(root) = self.ws.project_root.clone() else {
+            return;
+        };
+        self.ws.pr_list_err = None;
+        let mine = self.ws.pr_list_mine;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::review::list_prs(&root, mine));
+            c.request_repaint();
+        });
+        self.ws.pr_list_rx = Some(rx);
+    }
+
+    /// Review in a dedicated worktree: check the PR head out into
+    /// `~/.codelook/worktrees/…` (background — checkouts of big repos take a
+    /// while) and open it as its own project workspace when ready.
+    fn start_review_worktree(&mut self, ctx: &egui::Context, number: u64) {
+        if self.worktree_rx.is_some() {
+            return;
+        }
+        let Some(root) = self.ws.project_root.clone() else {
+            return;
+        };
+        self.ws.review_err = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::review::ensure_worktree(&root, number).map(|p| (p, number)));
+            c.request_repaint();
+        });
+        self.worktree_rx = Some(rx);
+        self.ws.status = format!("PR #{number} 워크트리 준비 중… (PR 시점으로 체크아웃)");
+    }
+
+    /// Jump to the next/previous change block in the active tab (review
+    /// overlay or the plain vs-HEAD gutter changes), wrapping around.
+    fn jump_change(&mut self, dir: isize) {
+        let Some(i) = self.ws.active.filter(|&i| i < self.ws.tabs.len()) else {
+            return;
+        };
+        let blocks = change_block_starts(&self.ws.tabs[i].git_changes);
+        if blocks.is_empty() {
+            return;
+        }
+        let cur = self.ws.tabs[i]
+            .caret_line
+            .or(self.ws.tabs[i].flash_line)
+            .unwrap_or(0);
+        let target = if dir > 0 {
+            blocks.iter().copied().find(|&b| b > cur).unwrap_or(blocks[0])
+        } else {
+            blocks
+                .iter()
+                .rev()
+                .copied()
+                .find(|&b| b < cur)
+                .unwrap_or(*blocks.last().unwrap())
+        };
+        self.record_origin();
+        self.set_jump_target(target);
+        let p = self.ws.tabs[i].path.clone();
+        self.record_nav(p, target);
+    }
+
+    /// Open a reviewed file as the FULL file (PR-head content) with its
+    /// change overlay — review with complete context, not a clipped diff.
+    fn open_review_file(&mut self, idx: usize) {
+        let Some(root) = self.ws.project_root.clone() else {
+            return;
+        };
+        let Some(sess) = self.ws.review.as_ref() else {
+            return;
+        };
+        let Some(rf) = sess.files.get(idx) else {
+            return;
+        };
+        // A deleted file has no head content — its unified diff is the view.
+        if rf.status == crate::git::FileStatus::Deleted {
+            self.open_review_diff(idx);
+            return;
+        }
+        let path = root.join(&rf.path);
+        let first_change = rf
+            .overlay
+            .changed
+            .first()
+            .map(|&(l, _)| l)
+            .or_else(|| rf.overlay.deleted_before.first().copied())
+            .unwrap_or(0);
+        let overlay = rf.overlay.clone();
+        let rel = rf.path.clone();
+        let head_id = sess.head_id.clone();
+        let from_disk = sess.head_is_workdir;
+
+        self.record_origin();
+        self.ws.diff_view = None;
+        if let Some(i) = self
+            .ws
+            .tabs
+            .iter()
+            .position(|t| t.is_review && t.path == path)
+        {
+            self.ws.active = Some(i);
+        } else {
+            let content = if from_disk {
+                std::fs::read_to_string(&path).ok()
+            } else {
+                crate::review::file_at(&root, &head_id, &rel)
+            };
+            let Some(content) = content else {
+                self.ws.status = format!("PR 파일을 읽을 수 없음: {rel}");
+                return;
+            };
+            let job = self
+                .highlighter
+                .highlight(path.to_str().unwrap_or(""), &content, self.font_size);
+            let lang = ast::Lang::from_path(&path);
+            let outline = lang
+                .map(|l| ast::document_symbols(l, &content))
+                .unwrap_or_default();
+            let mut tab = Tab::new(path.clone(), content, job, self.font_size, lang, outline);
+            tab.git_changes = overlay;
+            tab.is_review = true;
+            self.ws.tabs.push(tab);
+            self.ws.active = Some(self.ws.tabs.len() - 1);
+            self.refresh_search();
+        }
+        self.set_jump_target(first_change);
+        self.record_nav(path, first_change);
+    }
+
+    /// Open the classic unified diff (merge-base vs PR head) of a reviewed file.
+    fn open_review_diff(&mut self, idx: usize) {
+        let Some(root) = self.ws.project_root.clone() else {
+            return;
+        };
+        let Some(sess) = self.ws.review.as_ref() else {
+            return;
+        };
+        let Some(rf) = sess.files.get(idx) else {
+            return;
+        };
+        let lines = crate::git::range_file_diff(&root, &sess.base_id, &sess.head_id, &rf.path);
+        let (text, job) = build_diff_doc(&self.highlighter, &rf.path, &lines, self.font_size);
+        self.ws.diff_view = Some(DiffView {
+            commit_short: format!("PR #{}", sess.pr.number),
+            file: rf.path.clone(),
+            lines,
+            edit_buf: text.clone(),
+            text,
+            job,
+            jobs_font: self.font_size,
+        });
     }
 
     /// Refresh the working-tree status (and branch / ahead-behind) in the
@@ -2334,6 +2786,57 @@ impl eframe::App for CodeLookApp {
             }
         }
 
+        // A finished review-worktree checkout opens as its own project.
+        if let Some(rx) = &self.worktree_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.worktree_rx = None;
+                match res {
+                    Ok((path, n)) => {
+                        self.open_project(ctx, path);
+                        self.left_view = LeftView::Review;
+                        self.tree_open = true;
+                        self.start_review(ctx, n);
+                    }
+                    Err(e) => {
+                        self.ws.status = "PR 워크트리 실패".to_string();
+                        self.ws.review_err = Some(e);
+                    }
+                }
+            }
+        }
+
+        if let Some(rx) = &self.ws.pr_list_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.ws.pr_list_rx = None;
+                match res {
+                    Ok(list) => self.ws.pr_list = list,
+                    Err(e) => self.ws.pr_list_err = Some(e),
+                }
+            }
+        }
+
+        if let Some(rx) = &self.ws.review_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.ws.review_rx = None;
+                match res {
+                    Ok(sess) => {
+                        self.ws.status = format!(
+                            "PR #{} 로드 · 변경 파일 {}개",
+                            sess.pr.number,
+                            sess.files.len()
+                        );
+                        self.ws.review = Some(sess);
+                        self.left_view = LeftView::Review;
+                        self.tree_open = true;
+                    }
+                    Err(e) => {
+                        self.ws.status = "PR 로드 실패".to_string();
+                        self.ws.review_err = Some(e);
+                    }
+                }
+            }
+        }
+
         // While reviewing uncommitted changes (bottom-panel row or the left
         // Commit view), keep the file list fresh — files may be edited
         // outside, e.g. by an agent in a terminal.
@@ -2386,6 +2889,7 @@ impl eframe::App for CodeLookApp {
                 i.key_pressed(Key::Escape),
             )
         });
+        self.poll_menu(ctx);
         // Keymap shortcuts are suspended while the settings window captures keys.
         if !self.settings_open {
             self.handle_shortcuts(ctx);
@@ -2428,6 +2932,7 @@ impl eframe::App for CodeLookApp {
         self.bottom_bar(ctx);
         self.git_log_panel(ctx);
         self.side_tree(ctx);
+        self.right_strip(ctx);
         self.structure_panel(ctx);
         self.central(ctx);
         self.global_search_window(ctx);
@@ -2489,63 +2994,9 @@ impl CodeLookApp {
                         sep_dot(ui);
                     }
 
-                    if ui.button("프로젝트 열기").clicked() {
-                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                            self.open_project(ctx, dir);
-                        }
-                    }
-                    if ui
-                        .button("검색")
-                        .on_hover_text(self.keymap.text(crate::keymap::Action::FindInFile))
-                        .clicked()
-                        && self.ws.active.is_some()
-                    {
-                        self.ws.search_open = true;
-                        self.ws.search_focus = true;
-                    }
-                    if ui
-                        .button("전체 검색")
-                        .on_hover_text(self.keymap.text(crate::keymap::Action::FindInProject))
-                        .clicked()
-                        && self.ws.project_root.is_some()
-                    {
-                        self.ws.gsearch_open = true;
-                        self.ws.gsearch_focus = true;
-                        self.gsearch_warm(ctx);
-                    }
-
-                    ui.add_space(4.0);
-                    sep_dot(ui);
-                    // Tool-window toggles: project tree / structure / commits.
-                    if panel_toggle(ui, PanelSide::Left, self.tree_open, "프로젝트 트리") {
-                        self.tree_open = !self.tree_open;
-                    }
-                    if panel_toggle(ui, PanelSide::Right, self.structure_open, "구조(STRUCTURE)") {
-                        self.structure_open = !self.structure_open;
-                    }
-                    if panel_toggle(ui, PanelSide::Bottom, self.ws.log_open, "커밋 로그") {
-                        self.toggle_log(ctx);
-                    }
-                    sep_dot(ui);
-
-                    ui.add_space(4.0);
-                    if ui.small_button("A−").on_hover_text("글자 작게").clicked() {
-                        self.zoom(-1.0);
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("{}px", self.font_size as i32))
-                            .color(C_TEXT_DIM)
-                            .size(12.0),
-                    );
-                    if ui.small_button("A+").on_hover_text("글자 크게").clicked() {
-                        self.zoom(1.0);
-                    }
-                    ui.add_space(4.0);
-                    sep_dot(ui);
-                    if ui.small_button("설정").on_hover_text("단축키 설정").clicked() {
-                        self.settings_open = true;
-                    }
-
+                    // Panel toggles live on the window edges (tool strips),
+                    // and actions in the macOS menu bar / shortcuts — the
+                    // toolbar stays navigation-only.
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         if self.ws.indexing {
                             ui.spinner();
@@ -2564,7 +3015,16 @@ impl CodeLookApp {
     }
 
     fn side_tree(&mut self, ctx: &egui::Context) {
+        // Collapsed: keep the tool strip on the edge so reopening is obvious
+        // (IntelliJ New UI behavior — the strip never disappears).
         if !self.tree_open {
+            egui::SidePanel::left("tree_panel_strip")
+                .resizable(false)
+                .exact_width(36.0)
+                .frame(egui::Frame::default().fill(C_PANEL).inner_margin(0.0))
+                .show(ctx, |ui| {
+                    ui.horizontal_top(|ui| self.tool_strip(ui));
+                });
             return;
         }
         egui::SidePanel::left("tree_panel")
@@ -2579,6 +3039,7 @@ impl CodeLookApp {
                     ui.vertical(|ui| match self.left_view {
                         LeftView::Project => self.project_tree_view(ui),
                         LeftView::Commit => self.commit_sidebar(ui),
+                        LeftView::Review => self.review_sidebar(ui),
                     });
                 });
             });
@@ -2640,9 +3101,19 @@ impl CodeLookApp {
             Stroke::new(1.0, C_BORDER),
         );
         let n_changes = self.ws.git_status.len();
+        let review_tip = match &self.ws.review {
+            Some(s) => format!(
+                "코드리뷰 — PR #{} · {}/{} 검토",
+                s.pr.number,
+                s.viewed_count(),
+                s.files.len()
+            ),
+            None => "코드리뷰 (Pull Request)".to_string(),
+        };
         for (i, (view, tip)) in [
             (LeftView::Project, "프로젝트".to_string()),
             (LeftView::Commit, format!("변경사항 (커밋 전) — {n_changes}개 파일")),
+            (LeftView::Review, review_tip),
         ]
         .into_iter()
         .enumerate()
@@ -2652,7 +3123,7 @@ impl CodeLookApp {
                 Vec2::splat(26.0),
             );
             let resp = ui.interact(r, ui.id().with(("tool_strip", i)), Sense::click());
-            let active = self.left_view == view;
+            let active = self.tree_open && self.left_view == view;
             if active {
                 p.rect_filled(r, 6.0, C_HOVER);
             } else if resp.hovered() {
@@ -2677,11 +3148,103 @@ impl CodeLookApp {
                         );
                     }
                 }
+                LeftView::Review => {
+                    draw_pr_icon(p, r, if active { C_TEXT } else { C_TEXT_DIM });
+                    // Purple dot = a review session is loaded.
+                    if self.ws.review.is_some() {
+                        p.circle_filled(
+                            egui::pos2(r.right() - 3.0, r.top() + 3.0),
+                            3.0,
+                            Color32::from_rgb(0xc5, 0x95, 0xff),
+                        );
+                    }
+                }
             }
+            // Click the active icon to collapse the panel; any other click
+            // opens (or switches) it — IntelliJ tool-window semantics.
             if resp.on_hover_text(tip).clicked() {
-                self.left_view = view;
+                if active {
+                    self.tree_open = false;
+                } else {
+                    self.left_view = view;
+                    self.tree_open = true;
+                }
             }
         }
+
+        // Bottom-anchored: commit-log panel toggle (bottom tool window).
+        {
+            let r = Rect::from_min_size(
+                egui::pos2(rect.left() + 5.0, rect.bottom() - 34.0),
+                Vec2::splat(26.0),
+            );
+            let resp = ui.interact(r, ui.id().with("strip_commits"), Sense::click());
+            let active = self.ws.log_open;
+            if active {
+                p.rect_filled(r, 6.0, C_HOVER);
+            } else if resp.hovered() {
+                p.rect_filled(r, 6.0, C_HOVER.gamma_multiply(0.5));
+            }
+            // Git-commit glyph: a node on a line.
+            let c = if active { C_TEXT } else { C_TEXT_DIM };
+            let cy = r.center().y;
+            p.line_segment(
+                [egui::pos2(r.left() + 3.0, cy), egui::pos2(r.center().x - 5.0, cy)],
+                Stroke::new(1.4, c),
+            );
+            p.line_segment(
+                [egui::pos2(r.center().x + 5.0, cy), egui::pos2(r.right() - 3.0, cy)],
+                Stroke::new(1.4, c),
+            );
+            p.circle_stroke(r.center(), 4.5, Stroke::new(1.4, c));
+            if resp.on_hover_text("커밋 로그 (하단 패널)").clicked() {
+                let c = ui.ctx().clone();
+                self.toggle_log(&c);
+            }
+        }
+    }
+
+    /// Always-visible right edge strip: the Structure panel toggle.
+    fn right_strip(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("right_strip")
+            .resizable(false)
+            .exact_width(36.0)
+            .frame(egui::Frame::default().fill(C_PANEL).inner_margin(0.0))
+            .show(ctx, |ui| {
+                let h = ui.available_height();
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(36.0, h), Sense::hover());
+                let p = ui.painter();
+                p.vline(
+                    rect.left() + 0.5,
+                    rect.y_range(),
+                    Stroke::new(1.0, C_BORDER),
+                );
+                let r = Rect::from_min_size(
+                    egui::pos2(rect.left() + 5.0, rect.top() + 8.0),
+                    Vec2::splat(26.0),
+                );
+                let resp = ui.interact(r, ui.id().with("strip_structure"), Sense::click());
+                let active = self.structure_open;
+                if active {
+                    p.rect_filled(r, 6.0, C_HOVER);
+                } else if resp.hovered() {
+                    p.rect_filled(r, 6.0, C_HOVER.gamma_multiply(0.5));
+                }
+                // Structure glyph: bulleted outline rows (second one indented).
+                let c = if active { C_TEXT } else { C_TEXT_DIM };
+                for (i, indent) in [0.0_f32, 4.0, 0.0].iter().enumerate() {
+                    let y = r.top() + 7.0 + i as f32 * 6.0;
+                    let x = r.left() + 5.0 + indent;
+                    p.circle_filled(egui::pos2(x, y), 1.4, c);
+                    p.line_segment(
+                        [egui::pos2(x + 4.0, y), egui::pos2(r.right() - 4.0, y)],
+                        Stroke::new(1.3, c),
+                    );
+                }
+                if resp.on_hover_text("구조 (STRUCTURE)").clicked() {
+                    self.structure_open = !self.structure_open;
+                }
+            });
     }
 
     /// Left-panel Commit view: uncommitted working-tree changes at a glance;
@@ -2753,6 +3316,534 @@ impl CodeLookApp {
             });
         if let Some(f) = open {
             self.open_working_diff(f);
+        }
+    }
+
+    /// Left REVIEW panel: full-context PR review. Load a PR by number; the
+    /// changed-file list opens FULL files with the PR's changes overlaid,
+    /// per-file unified diffs, and viewed-tracking with progress.
+    fn review_sidebar(&mut self, ui: &mut egui::Ui) {
+        self.left_header(ui, "REVIEW", false);
+        let loading = self.ws.review_rx.is_some() || self.worktree_rx.is_some();
+
+        // No session yet: the PR-number prompt.
+        if self.ws.review.is_none() {
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("PR 번호로 리뷰 시작")
+                        .color(C_TEXT_DIM)
+                        .size(12.0),
+                );
+            });
+            ui.add_space(4.0);
+            let mut go = false;
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.ws.review_input)
+                        .hint_text("예: 50460")
+                        .desired_width(90.0),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    go = true;
+                }
+                if loading {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("불러오는 중…").color(C_TEXT_DIM).size(12.0),
+                    );
+                } else if ui.button("불러오기").clicked() {
+                    go = true;
+                }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.checkbox(&mut self.ws.review_worktree, "")
+                    .on_hover_text("별도 워크트리에 PR을 체크아웃해 프로젝트 전체를 PR 시점으로 엽니다.\n지금 작업 트리는 건드리지 않습니다.");
+                ui.label(
+                    egui::RichText::new("전용 워크트리에서 (전체 코드 = PR 시점)")
+                        .color(C_TEXT_DIM)
+                        .size(11.5),
+                );
+            });
+            if let Some(e) = self.ws.review_err.clone() {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(e)
+                                .color(Color32::from_rgb(0xe0, 0x6c, 0x75))
+                                .size(11.5),
+                        )
+                        .wrap(),
+                    );
+                });
+            }
+            // Open-PR picker: choose from the repo's open PRs instead of
+            // typing a number. Loaded once per panel visit via gh.
+            if self.ws.pr_list.is_empty()
+                && self.ws.pr_list_rx.is_none()
+                && self.ws.pr_list_err.is_none()
+                && self.shot.is_none()
+            {
+                let ctx = ui.ctx().clone();
+                self.kick_pr_list(&ctx);
+            }
+            let mut chosen: Option<u64> = None;
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                let what = if self.ws.pr_list_mine {
+                    "내 리뷰 요청"
+                } else {
+                    "열린 PR"
+                };
+                ui.label(
+                    egui::RichText::new(if self.ws.pr_list.is_empty() {
+                        what.to_string()
+                    } else {
+                        format!("{what} {}개", self.ws.pr_list.len())
+                    })
+                    .color(C_HEADER)
+                    .size(11.5),
+                );
+                if self.ws.pr_list_rx.is_some() {
+                    ui.spinner();
+                } else {
+                    let toggle = if self.ws.pr_list_mine {
+                        "전체 보기"
+                    } else {
+                        "내 리뷰만"
+                    };
+                    if ui.small_button(toggle).clicked() {
+                        self.ws.pr_list_mine = !self.ws.pr_list_mine;
+                        self.ws.pr_list.clear();
+                        self.ws.pr_list_err = None;
+                        let ctx = ui.ctx().clone();
+                        self.kick_pr_list(&ctx);
+                    }
+                    if ui.small_button("새로고침").clicked() {
+                        self.ws.pr_list.clear();
+                        self.ws.pr_list_err = None;
+                        let ctx = ui.ctx().clone();
+                        self.kick_pr_list(&ctx);
+                    }
+                }
+            });
+            if let Some(e) = &self.ws.pr_list_err {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("PR 목록 불가 (gh CLI): {e}"))
+                                .color(C_TEXT_DIM)
+                                .size(11.0),
+                        )
+                        .wrap(),
+                    );
+                });
+            }
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .id_salt(("pr_list", self.ws.seq))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for pr in &self.ws.pr_list {
+                        let (rr, resp) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 40.0),
+                            Sense::click(),
+                        );
+                        let p = ui.painter();
+                        if resp.hovered() {
+                            p.rect_filled(rr, 0.0, C_HOVER);
+                        }
+                        let y1 = rr.top() + 13.0;
+                        let y2 = rr.top() + 29.0;
+                        let num_r = p.text(
+                            egui::pos2(rr.left() + 10.0, y1),
+                            Align2::LEFT_CENTER,
+                            format!("#{}", pr.number),
+                            FontId::proportional(12.0),
+                            Color32::from_rgb(0x61, 0xaf, 0xef),
+                        );
+                        let clip = Rect::from_min_max(
+                            rr.min,
+                            egui::pos2(rr.right() - 8.0, rr.bottom()),
+                        );
+                        let pc = ui.painter().with_clip_rect(clip);
+                        pc.text(
+                            egui::pos2(num_r.right() + 8.0, y1),
+                            Align2::LEFT_CENTER,
+                            &pr.title,
+                            FontId::proportional(12.5),
+                            C_TEXT,
+                        );
+                        pc.text(
+                            egui::pos2(rr.left() + 10.0, y2),
+                            Align2::LEFT_CENTER,
+                            format!("{} · {}", pr.author, pr.head_branch),
+                            FontId::proportional(10.5),
+                            C_TEXT_DIM,
+                        );
+                        if resp
+                            .on_hover_text(format!("#{} {}", pr.number, pr.title))
+                            .clicked()
+                        {
+                            chosen = Some(pr.number);
+                        }
+                    }
+                    if self.ws.pr_list.is_empty() && self.ws.pr_list_rx.is_none() {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new("표시할 열린 PR이 없습니다")
+                                    .color(C_TEXT_DIM)
+                                    .size(11.5),
+                            );
+                        });
+                    }
+                    ui.add_space(6.0);
+                });
+
+            if go && !loading {
+                match self.ws.review_input.trim().parse::<u64>() {
+                    Ok(n) => chosen = Some(n),
+                    Err(_) => self.ws.review_err = Some("숫자 PR 번호를 입력하세요".into()),
+                }
+            }
+            if let Some(n) = chosen.filter(|_| !loading) {
+                self.ws.review_input = n.to_string();
+                let ctx = ui.ctx().clone();
+                if self.ws.review_worktree {
+                    self.start_review_worktree(&ctx, n);
+                } else {
+                    self.start_review(&ctx, n);
+                }
+            }
+            return;
+        }
+
+        // Session view. Reads first, mutations deferred to the end.
+        let root = self.ws.project_root.clone().unwrap_or_default();
+        let active_rel: Option<String> = self
+            .ws
+            .active
+            .and_then(|i| self.ws.tabs.get(i))
+            .filter(|t| t.is_review)
+            .and_then(|t| t.path.strip_prefix(&root).ok())
+            .map(|p| p.to_string_lossy().to_string());
+        let diff_open: Option<String> = self
+            .ws
+            .diff_view
+            .as_ref()
+            .filter(|d| d.commit_short.starts_with("PR #"))
+            .map(|d| d.file.clone());
+        let mut open_file_idx: Option<usize> = None;
+        let mut open_diff_idx: Option<usize> = None;
+        let mut toggle_viewed: Option<usize> = None;
+        let mut close = false;
+        let mut reload: Option<u64> = None;
+        let mut to_worktree: Option<u64> = None;
+
+        {
+            let sess = self.ws.review.as_ref().unwrap();
+            let pr = &sess.pr;
+            let (viewed, total) = (sess.viewed_count(), sess.files.len());
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(format!("#{}", pr.number))
+                        .color(Color32::from_rgb(0x61, 0xaf, 0xef))
+                        .strong()
+                        .size(13.0),
+                );
+                if !pr.author.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("by {}", pr.author))
+                            .color(C_TEXT_DIM)
+                            .size(11.5),
+                    );
+                }
+            });
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&pr.title).color(C_TEXT).size(12.5))
+                        .wrap(),
+                );
+            });
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                let branches = if pr.head_branch.is_empty() {
+                    pr.base_branch.clone()
+                } else {
+                    format!("{} ← {}", pr.base_branch, pr.head_branch)
+                };
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(branches).color(C_TEXT_DIM).size(11.0),
+                    )
+                    .truncate(),
+                );
+            });
+            if !sess.head_is_workdir {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("파일은 PR head 시점 내용 (체크아웃 없음)")
+                            .color(C_TEXT_DIM)
+                            .italics()
+                            .size(10.5),
+                    );
+                });
+            }
+
+            // Progress: n/m viewed + a thin bar.
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(format!("검토 {viewed}/{total}"))
+                        .color(C_TEXT_DIM)
+                        .size(11.5),
+                );
+                let w = (ui.available_width() - 14.0).max(20.0);
+                let (br, _) = ui.allocate_exact_size(Vec2::new(w, 4.0), Sense::hover());
+                let br = Rect::from_center_size(br.center(), Vec2::new(w, 4.0));
+                ui.painter().rect_filled(br, 2.0, C_BORDER);
+                if total > 0 && viewed > 0 {
+                    let f = viewed as f32 / total as f32;
+                    ui.painter().rect_filled(
+                        Rect::from_min_size(br.min, Vec2::new(br.width() * f, 4.0)),
+                        2.0,
+                        Color32::from_rgb(0x62, 0xb5, 0x43),
+                    );
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                if loading {
+                    ui.spinner();
+                } else {
+                    if ui.small_button("다시 로드").clicked() {
+                        reload = Some(pr.number);
+                    }
+                    if !sess.head_is_workdir
+                        && ui
+                            .small_button("워크트리에서 열기")
+                            .on_hover_text(
+                                "PR을 별도 워크트리에 체크아웃해 프로젝트 전체를 PR 시점으로 엽니다",
+                            )
+                            .clicked()
+                    {
+                        to_worktree = Some(pr.number);
+                    }
+                }
+                if ui.small_button("세션 종료").clicked() {
+                    close = true;
+                }
+            });
+            ui.add_space(6.0);
+
+            // Changed-file rows: filename + dim directory, +N −M counts, a
+            // unified-diff button and the viewed check.
+            egui::ScrollArea::vertical()
+                .id_salt(("review_sidebar", self.ws.seq))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (i, f) in sess.files.iter().enumerate() {
+                        let (rr, resp) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 38.0),
+                            Sense::click(),
+                        );
+                        let is_open = active_rel.as_deref() == Some(f.path.as_str())
+                            || diff_open.as_deref() == Some(f.path.as_str());
+                        {
+                            let p = ui.painter();
+                            if is_open {
+                                p.rect_filled(rr, 0.0, C_SEL);
+                            } else if resp.hovered() {
+                                p.rect_filled(rr, 0.0, C_HOVER);
+                            }
+                        }
+                        let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+                        let dir = f.path[..f.path.len() - name.len()]
+                            .trim_end_matches('/')
+                            .to_string();
+                        let y1 = rr.top() + 12.0;
+                        let y2 = rr.top() + 27.0;
+                        let text_c = if f.viewed { C_TEXT_DIM } else { C_TEXT };
+                        let p = ui.painter();
+                        p.text(
+                            egui::pos2(rr.left() + 10.0, y1),
+                            Align2::LEFT_CENTER,
+                            status_letter(f.status),
+                            FontId::monospace(12.0),
+                            status_color(f.status),
+                        );
+                        // Right-aligned counts on line 1, before the buttons.
+                        let counts_right = rr.right() - 52.0;
+                        let del_g = p.layout_no_wrap(
+                            format!("−{}", f.deleted),
+                            FontId::monospace(10.5),
+                            Color32::from_rgb(0xe0, 0x6c, 0x75),
+                        );
+                        p.galley(
+                            egui::pos2(counts_right - del_g.size().x, y1 - del_g.size().y / 2.0),
+                            del_g.clone(),
+                            Color32::from_rgb(0xe0, 0x6c, 0x75),
+                        );
+                        let add_g = p.layout_no_wrap(
+                            format!("+{} ", f.added),
+                            FontId::monospace(10.5),
+                            Color32::from_rgb(0x62, 0xb5, 0x43),
+                        );
+                        p.galley(
+                            egui::pos2(
+                                counts_right - del_g.size().x - add_g.size().x,
+                                y1 - add_g.size().y / 2.0,
+                            ),
+                            add_g.clone(),
+                            Color32::from_rgb(0x62, 0xb5, 0x43),
+                        );
+                        // Filename (clipped left of the counts) + dim directory.
+                        let name_clip = Rect::from_min_max(
+                            rr.min,
+                            egui::pos2(counts_right - del_g.size().x - add_g.size().x - 4.0, rr.bottom()),
+                        );
+                        let pc = ui.painter().with_clip_rect(name_clip);
+                        pc.text(
+                            egui::pos2(rr.left() + 26.0, y1),
+                            Align2::LEFT_CENTER,
+                            name,
+                            FontId::proportional(12.5),
+                            if is_open { Color32::WHITE } else { text_c },
+                        );
+                        let dir_clip =
+                            Rect::from_min_max(rr.min, egui::pos2(rr.right() - 48.0, rr.bottom()));
+                        let pd = ui.painter().with_clip_rect(dir_clip);
+                        pd.text(
+                            egui::pos2(rr.left() + 26.0, y2),
+                            Align2::LEFT_CENTER,
+                            dir,
+                            FontId::proportional(10.5),
+                            C_TEXT_DIM,
+                        );
+
+                        // Unified-diff button (±) and viewed check, right side.
+                        let diff_r = Rect::from_center_size(
+                            egui::pos2(rr.right() - 38.0, rr.center().y),
+                            Vec2::splat(18.0),
+                        );
+                        let check_r = Rect::from_center_size(
+                            egui::pos2(rr.right() - 15.0, rr.center().y),
+                            Vec2::splat(18.0),
+                        );
+                        let diff_resp =
+                            ui.interact(diff_r, ui.id().with(("rvw_diff", i)), Sense::click());
+                        let check_resp =
+                            ui.interact(check_r, ui.id().with(("rvw_check", i)), Sense::click());
+                        let p = ui.painter();
+                        if diff_resp.hovered() {
+                            p.rect_filled(diff_r, 4.0, C_HOVER);
+                        }
+                        p.text(
+                            diff_r.center(),
+                            Align2::CENTER_CENTER,
+                            "±",
+                            FontId::monospace(13.0),
+                            if diff_resp.hovered() { C_TEXT } else { C_TEXT_DIM },
+                        );
+                        if check_resp.hovered() {
+                            p.rect_filled(check_r, 4.0, C_HOVER);
+                        }
+                        let cc = check_r.center();
+                        if f.viewed {
+                            p.circle_filled(cc, 7.0, Color32::from_rgb(0x62, 0xb5, 0x43));
+                            let st = Stroke::new(1.6, Color32::from_rgb(0x1e, 0x1f, 0x22));
+                            p.line_segment(
+                                [cc + Vec2::new(-3.2, 0.2), cc + Vec2::new(-1.0, 2.4)],
+                                st,
+                            );
+                            p.line_segment(
+                                [cc + Vec2::new(-1.0, 2.4), cc + Vec2::new(3.4, -2.4)],
+                                st,
+                            );
+                        } else {
+                            p.circle_stroke(
+                                cc,
+                                7.0,
+                                Stroke::new(1.2, if check_resp.hovered() { C_TEXT } else { C_TEXT_DIM }),
+                            );
+                        }
+
+                        if check_resp.on_hover_text("검토 완료 표시").clicked() {
+                            toggle_viewed = Some(i);
+                        } else if diff_resp.on_hover_text("diff로 보기").clicked() {
+                            open_diff_idx = Some(i);
+                        } else if resp.on_hover_text(&f.path).clicked() {
+                            open_file_idx = Some(i);
+                        }
+                    }
+                    ui.add_space(6.0);
+                });
+        }
+
+        // Deferred mutations.
+        if let Some(i) = toggle_viewed {
+            if let Some(s) = self.ws.review.as_mut() {
+                if let Some(f) = s.files.get_mut(i) {
+                    f.viewed = !f.viewed;
+                }
+            }
+        }
+        if let Some(i) = open_file_idx {
+            self.open_review_file(i);
+        }
+        if let Some(i) = open_diff_idx {
+            self.open_review_diff(i);
+        }
+        if let Some(n) = reload {
+            let ctx = ui.ctx().clone();
+            self.start_review(&ctx, n);
+        }
+        if let Some(n) = to_worktree {
+            let ctx = ui.ctx().clone();
+            self.start_review_worktree(&ctx, n);
+        }
+        if close {
+            self.ws.review = None;
+            self.ws.review_err = None;
+            let active_path = self
+                .ws
+                .active
+                .and_then(|i| self.ws.tabs.get(i))
+                .map(|t| t.path.clone());
+            self.ws.tabs.retain(|t| !t.is_review);
+            self.ws.active = active_path
+                .and_then(|p| self.ws.tabs.iter().position(|t| t.path == p))
+                .or(if self.ws.tabs.is_empty() { None } else { Some(0) });
+            if self
+                .ws
+                .diff_view
+                .as_ref()
+                .is_some_and(|d| d.commit_short.starts_with("PR #"))
+            {
+                self.ws.diff_view = None;
+            }
         }
     }
 
@@ -3559,8 +4650,170 @@ impl CodeLookApp {
                     self.welcome(ui);
                     return;
                 }
+                self.review_bar(ui);
                 self.editor(ui, bg);
             });
+    }
+
+    /// Slim review header above the editor for PR tabs (IntelliJ diff-header
+    /// style): jump to the source file, step through changes, and mark the
+    /// file viewed / move on — the whole review loop without the panel.
+    fn review_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(idx) = self.ws.active.filter(|&i| i < self.ws.tabs.len()) else {
+            return;
+        };
+        if !self.ws.tabs[idx].is_review {
+            return;
+        }
+        let Some(root) = self.ws.project_root.clone() else {
+            return;
+        };
+        let Ok(rel) = self.ws.tabs[idx]
+            .path
+            .strip_prefix(&root)
+            .map(|p| p.to_string_lossy().to_string())
+        else {
+            return;
+        };
+        let Some(sess) = self.ws.review.as_ref() else {
+            return;
+        };
+        let pr_no = sess.pr.number;
+        let fi = sess.files.iter().position(|f| f.path == rel);
+        let (viewed, added, deleted) = fi
+            .map(|i| {
+                let f = &sess.files[i];
+                (f.viewed, f.added, f.deleted)
+            })
+            .unwrap_or((false, 0, 0));
+        let (viewed_files, total_files) = (sess.viewed_count(), sess.files.len());
+
+        let blocks = change_block_starts(&self.ws.tabs[idx].git_changes);
+        let cur = self.ws.tabs[idx]
+            .caret_line
+            .or(self.ws.tabs[idx].flash_line)
+            .unwrap_or(0);
+        let k = blocks.partition_point(|&b| b <= cur);
+        let up_tip = format!("이전 변경 ({})", self.keymap.text(crate::keymap::Action::PrevChange));
+        let down_tip = format!("다음 변경 ({})", self.keymap.text(crate::keymap::Action::NextChange));
+
+        let mut dir = 0isize;
+        let mut to_source = false;
+        let mut flip_viewed = false;
+        let mut next_file = false;
+
+        let resp = egui::Frame::default()
+            .fill(C_PANEL)
+            .inner_margin(egui::Margin::symmetric(10, 3))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(
+                        egui::RichText::new(format!("PR #{pr_no}"))
+                            .color(Color32::from_rgb(0xc5, 0x95, 0xff))
+                            .size(11.5),
+                    );
+                    sep_dot(ui);
+                    if crosshair_button(ui, "원본 파일로 이동 (작업 트리의 이 파일)") {
+                        to_source = true;
+                    }
+                    sep_dot(ui);
+                    if chevron_button(ui, false, &up_tip) {
+                        dir = -1;
+                    }
+                    if chevron_button(ui, true, &down_tip) {
+                        dir = 1;
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("변경 {k}/{}", blocks.len()))
+                            .color(C_TEXT_DIM)
+                            .size(11.5),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("+{added}"))
+                            .color(Color32::from_rgb(0x62, 0xb5, 0x43))
+                            .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("−{deleted}"))
+                            .color(Color32::from_rgb(0xe0, 0x6c, 0x75))
+                            .size(11.0),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if fi.is_some() {
+                            if ui
+                                .small_button("다음 파일")
+                                .on_hover_text("이 파일을 검토됨으로 표시하고 다음 미검토 파일 열기")
+                                .clicked()
+                            {
+                                next_file = true;
+                            }
+                            let label = if viewed { "검토됨" } else { "검토 완료" };
+                            let btn = egui::Button::new(
+                                egui::RichText::new(label)
+                                    .size(11.5)
+                                    .color(if viewed {
+                                        Color32::from_rgb(0x1e, 0x1f, 0x22)
+                                    } else {
+                                        C_TEXT
+                                    }),
+                            )
+                            .fill(if viewed {
+                                Color32::from_rgb(0x62, 0xb5, 0x43)
+                            } else {
+                                C_HOVER
+                            });
+                            if ui.add(btn).on_hover_text("검토 상태 토글").clicked() {
+                                flip_viewed = true;
+                            }
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{viewed_files}/{total_files} 파일"))
+                                .color(C_TEXT_DIM)
+                                .size(11.0),
+                        );
+                    });
+                });
+            })
+            .response;
+        // Hairline between the bar and the code.
+        ui.painter().line_segment(
+            [
+                egui::pos2(resp.rect.left(), resp.rect.bottom() - 0.5),
+                egui::pos2(resp.rect.right(), resp.rect.bottom() - 0.5),
+            ],
+            Stroke::new(1.0, C_BORDER),
+        );
+
+        if dir != 0 {
+            self.jump_change(dir);
+        }
+        if to_source {
+            let ctx = ui.ctx().clone();
+            self.open_source_file(&ctx);
+        }
+        if flip_viewed {
+            if let (Some(s), Some(i)) = (self.ws.review.as_mut(), fi) {
+                s.files[i].viewed = !s.files[i].viewed;
+            }
+        }
+        if next_file {
+            let mut open_next: Option<usize> = None;
+            if let (Some(s), Some(i)) = (self.ws.review.as_mut(), fi) {
+                s.files[i].viewed = true;
+                let n = s.files.len();
+                open_next = (1..n)
+                    .map(|d| (i + d) % n)
+                    .find(|&j| !s.files[j].viewed);
+            }
+            match open_next {
+                Some(j) => self.open_review_file(j),
+                None => self.ws.status = "모든 파일 검토 완료".to_string(),
+            }
+        }
     }
 
     /// Render the open commit diff (header + unified diff body).
@@ -3797,6 +5050,7 @@ impl CodeLookApp {
                                     .to_string_lossy()
                                     .to_string();
 
+                                let is_review = self.ws.tabs[i].is_review;
                                 let text_w = ui
                                     .fonts(|f| {
                                         f.layout_no_wrap(
@@ -3807,7 +5061,9 @@ impl CodeLookApp {
                                     })
                                     .size()
                                     .x;
-                                let tab_w = 16.0 + 16.0 + 6.0 + text_w + 8.0 + 16.0 + 12.0;
+                                let badge_w = if is_review { 22.0 } else { 0.0 };
+                                let tab_w =
+                                    16.0 + 16.0 + 6.0 + text_w + badge_w + 8.0 + 16.0 + 12.0;
                                 let (rect, resp) = ui.allocate_exact_size(
                                     Vec2::new(tab_w, TAB_H),
                                     Sense::click(),
@@ -3826,13 +5082,23 @@ impl CodeLookApp {
                                     Vec2::splat(15.0),
                                 );
                                 self.icons.file(p, icon, &name);
-                                p.text(
+                                let name_r = p.text(
                                     egui::pos2(icon.right() + 6.0, rect.center().y),
                                     egui::Align2::LEFT_CENTER,
                                     &name,
                                     FontId::proportional(13.0),
                                     if selected { C_TEXT } else { C_TEXT_DIM },
                                 );
+                                // Review tabs show PR-head content, not disk.
+                                if is_review {
+                                    p.text(
+                                        egui::pos2(name_r.right() + 5.0, rect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        "PR",
+                                        FontId::proportional(9.5),
+                                        Color32::from_rgb(0xc5, 0x95, 0xff),
+                                    );
+                                }
 
                                 // Close affordance (✕ drawn, not glyph).
                                 let close_c = Rect::from_center_size(
@@ -4076,6 +5342,40 @@ impl CodeLookApp {
                         }
                     }
 
+                    // PR-review overlay: the diff painted over the COMPLETE
+                    // file — full-width bands on changed lines (green =
+                    // added, blue = modified), red seams where lines were
+                    // deleted.
+                    if tab.is_review {
+                        let p = ui.painter();
+                        for &(line, kind) in &tab.git_changes.changed {
+                            let y = out.galley_pos.y + row_h * line as f32;
+                            let col = match kind {
+                                crate::git::LineChange::Added => {
+                                    Color32::from_rgba_unmultiplied(0x62, 0xb5, 0x43, 26)
+                                }
+                                crate::git::LineChange::Modified => {
+                                    Color32::from_rgba_unmultiplied(0x6c, 0x9c, 0xd2, 24)
+                                }
+                            };
+                            p.rect_filled(
+                                Rect::from_min_max(
+                                    egui::pos2(band_left, y),
+                                    egui::pos2(band_right, y + row_h),
+                                ),
+                                0.0,
+                                col,
+                            );
+                        }
+                        for &line in &tab.git_changes.deleted_before {
+                            let y = out.galley_pos.y + row_h * line as f32;
+                            p.line_segment(
+                                [egui::pos2(band_left, y), egui::pos2(band_right, y)],
+                                Stroke::new(1.5, Color32::from_rgba_unmultiplied(0xe0, 0x6c, 0x75, 150)),
+                            );
+                        }
+                    }
+
                     // Active (caret) line band, from the TRACKED caret — a
                     // freshly opened file shows no band until the user clicks
                     // or jumps. Translucent so text shows through.
@@ -4161,6 +5461,65 @@ impl CodeLookApp {
             self.goto_definition(&w);
         }
     }
+}
+
+/// Small crosshair (locate) button, painter-drawn like the tree header's.
+fn crosshair_button(ui: &mut egui::Ui, tip: &str) -> bool {
+    let (r, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(r, 4.0, C_HOVER);
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let c = if resp.hovered() { C_TEXT } else { C_TEXT_DIM };
+    let center = r.center();
+    p.circle_stroke(center, 4.5, Stroke::new(1.3, c));
+    p.circle_filled(center, 1.4, c);
+    for (dx, dy) in [(0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)] {
+        let v = Vec2::new(dx, dy);
+        p.line_segment([center + v * 4.5, center + v * 7.0], Stroke::new(1.3, c));
+    }
+    resp.on_hover_text(tip).clicked()
+}
+
+/// Small painter-drawn chevron button (▲/▼ without relying on font glyphs).
+fn chevron_button(ui: &mut egui::Ui, down: bool, tip: &str) -> bool {
+    let (r, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(r, 4.0, C_HOVER);
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let c = if resp.hovered() { C_TEXT } else { C_TEXT_DIM };
+    let cx = r.center();
+    let (a, b, m) = if down {
+        (Vec2::new(-4.0, -2.0), Vec2::new(4.0, -2.0), Vec2::new(0.0, 2.5))
+    } else {
+        (Vec2::new(-4.0, 2.0), Vec2::new(4.0, 2.0), Vec2::new(0.0, -2.5))
+    };
+    let st = Stroke::new(1.6, c);
+    p.line_segment([cx + a, cx + m], st);
+    p.line_segment([cx + m, cx + b], st);
+    resp.on_hover_text(tip).clicked()
+}
+
+/// First line of every change block: consecutive changed lines collapse to
+/// their first line, and each deletion point counts as a block. Sorted.
+fn change_block_starts(fd: &crate::git::FileDiff) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut lines: Vec<usize> = fd.changed.iter().map(|&(l, _)| l).collect();
+    lines.sort_unstable();
+    let mut prev = usize::MAX;
+    for l in lines {
+        if prev == usize::MAX || l != prev + 1 {
+            starts.push(l);
+        }
+        prev = l;
+    }
+    starts.extend(fd.deleted_before.iter().copied());
+    starts.sort_unstable();
+    starts.dedup();
+    starts
 }
 
 /// Number of distinct files in a (path-grouped) hit list — shown in the
@@ -4316,6 +5675,31 @@ fn draw_crumb_sep(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
 }
 
 /// Draw a small git-branch glyph (two nodes on a trunk + a fork) centered at `c`.
+/// GitHub-style pull-request glyph: base column (circle-line-circle) plus a
+/// head column flowing in at the top and down to its merge circle.
+fn draw_pr_icon(p: &egui::Painter, r: Rect, color: Color32) {
+    let st = Stroke::new(1.4, color);
+    let lx = r.left() + 8.5;
+    let rx = r.right() - 8.5;
+    let ty = r.top() + 7.0;
+    let by = r.bottom() - 7.0;
+    p.circle_stroke(egui::pos2(lx, ty), 2.6, st);
+    p.circle_stroke(egui::pos2(lx, by), 2.6, st);
+    p.line_segment([egui::pos2(lx, ty + 2.6), egui::pos2(lx, by - 2.6)], st);
+    p.circle_stroke(egui::pos2(rx, by), 2.6, st);
+    p.line_segment([egui::pos2(rx, by - 2.6), egui::pos2(rx, ty)], st);
+    p.line_segment([egui::pos2(rx, ty), egui::pos2(lx + 4.5, ty)], st);
+    // Arrowhead pointing into the base branch.
+    p.line_segment(
+        [egui::pos2(lx + 7.5, ty - 3.0), egui::pos2(lx + 4.5, ty)],
+        st,
+    );
+    p.line_segment(
+        [egui::pos2(lx + 7.5, ty + 3.0), egui::pos2(lx + 4.5, ty)],
+        st,
+    );
+}
+
 fn draw_branch_icon(p: &egui::Painter, c: egui::Pos2, color: Color32) {
     let st = Stroke::new(1.2, color);
     let (top, bot, fork) = (
@@ -4337,51 +5721,6 @@ fn draw_x(painter: &egui::Painter, rect: Rect, color: Color32) {
     let st = Stroke::new(1.3, color);
     painter.line_segment([egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)], st);
     painter.line_segment([egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)], st);
-}
-
-/// Which edge a tool-window sits on (for the toggle icon).
-#[derive(Clone, Copy)]
-enum PanelSide {
-    Left,
-    Right,
-    Bottom,
-}
-
-/// An IntelliJ-style tool-window toggle: a small window glyph with the docked
-/// region highlighted. `active` = panel currently visible. Returns clicked.
-fn panel_toggle(ui: &mut egui::Ui, side: PanelSide, active: bool, tip: &str) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 22.0), Sense::click());
-    let resp = resp.on_hover_text(tip);
-    let p = ui.painter();
-    if resp.hovered() {
-        p.rect_filled(rect, 4.0, C_HOVER);
-    }
-    // The window frame.
-    let win = Rect::from_center_size(rect.center(), Vec2::new(15.0, 13.0));
-    let frame_col = if active { C_TEXT } else { C_TEXT_DIM };
-    p.rect_stroke(win, 2.0, Stroke::new(1.3, frame_col), egui::StrokeKind::Inside);
-    // The docked region.
-    let region = match side {
-        PanelSide::Left => Rect::from_min_max(
-            win.min,
-            egui::pos2(win.left() + win.width() * 0.42, win.bottom()),
-        ),
-        PanelSide::Right => Rect::from_min_max(
-            egui::pos2(win.right() - win.width() * 0.42, win.top()),
-            win.max,
-        ),
-        PanelSide::Bottom => Rect::from_min_max(
-            egui::pos2(win.left(), win.bottom() - win.height() * 0.42),
-            win.max,
-        ),
-    };
-    let fill = if active {
-        C_ACCENT
-    } else {
-        C_TEXT_DIM.gamma_multiply(0.5)
-    };
-    p.rect_filled(region.shrink(1.2), 1.0, fill);
-    resp.clicked()
 }
 
 /// A toolbar Back/Forward arrow button (drawn chevron). Greyed out when
