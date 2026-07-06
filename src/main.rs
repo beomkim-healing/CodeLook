@@ -5,6 +5,7 @@ mod ast;
 mod git;
 mod highlight;
 mod icons;
+mod keymap;
 mod search;
 mod symbols;
 

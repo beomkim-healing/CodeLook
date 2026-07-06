@@ -48,9 +48,12 @@ fn definition_patterns() -> Vec<Regex> {
     .collect()
 }
 
-pub fn build_index(root: &Path) -> SymbolIndex {
+/// Symbol index for ⌘+Click plus the plain file list (every walked file,
+/// respecting ignores) that powers the "Go to File" finder.
+pub fn build_index(root: &Path) -> (SymbolIndex, Vec<PathBuf>) {
     let patterns = definition_patterns();
     let mut index: SymbolIndex = HashMap::new();
+    let mut files: Vec<PathBuf> = Vec::new();
 
     let walker = WalkBuilder::new(root)
         .hidden(true)
@@ -68,6 +71,7 @@ pub fn build_index(root: &Path) -> SymbolIndex {
             continue;
         }
         let path = entry.path();
+        files.push(path.to_path_buf());
         // Only source files enter the index (AST languages, or the regex
         // fallback's code-extension whitelist) — never docs/config.
         let lang = crate::ast::Lang::from_path(path);
@@ -88,7 +92,8 @@ pub fn build_index(root: &Path) -> SymbolIndex {
             None => scan(path, &content, &patterns, &mut index),
         }
     }
-    index
+    files.sort();
+    (index, files)
 }
 
 #[cfg(test)]
@@ -105,7 +110,7 @@ mod tests {
             "예시:\n```kotlin\nclass FooBarBaz {}\n```\n",
         )
         .unwrap();
-        let index = build_index(&dir);
+        let (index, _files) = build_index(&dir);
         let locs = index.get("FooBarBaz").expect("kt definition indexed");
         assert!(locs.iter().all(|l| l.path.extension().unwrap() == "kt"));
         std::fs::remove_dir_all(&dir).ok();

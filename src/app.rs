@@ -69,6 +69,15 @@ struct Tab {
     scroll_to_line: Option<usize>,
     /// Line to keep softly highlighted after a jump (until the next navigation).
     flash_line: Option<usize>,
+    /// Last caret position (char index / line), tracked so jumps can record
+    /// the exact origin for Back and ⌘B can resolve the word under the caret.
+    /// Updated only when the TextEdit caret actually moves (see editor()) —
+    /// jumps overwrite it with the destination so stale carets never leak
+    /// into the navigation history.
+    caret_ci: Option<usize>,
+    caret_line: Option<usize>,
+    /// Raw TextEdit caret from the previous frame (change detector).
+    last_cursor_ci: Option<usize>,
     lang: Option<ast::Lang>,
     outline: Vec<DocSymbol>,
     /// Per-line changes vs HEAD, for the gutter change bars.
@@ -97,6 +106,9 @@ impl Tab {
             line_count,
             scroll_to_line: None,
             flash_line: None,
+            caret_ci: None,
+            caret_line: None,
+            last_cursor_ci: None,
             lang,
             outline,
             git_changes: crate::git::FileDiff::default(),
@@ -139,12 +151,77 @@ struct DiffView {
     commit_short: String,
     file: String,
     lines: Vec<crate::git::DiffLine>,
-    /// Per-line syntax-highlighted jobs (None for hunk headers). Built from
-    /// the reconstructed old/new documents so multi-line constructs keep
-    /// their colors inside a hunk.
-    jobs: Vec<Option<LayoutJob>>,
-    /// Font size the jobs were built at (rebuilt on zoom).
+    /// The whole diff body as one syntax-highlighted document, rendered via a
+    /// read-only TextEdit so the text is drag-selectable / copyable.
+    text: String,
+    job: LayoutJob,
+    /// TextEdit buffer; reverted to `text` on any edit (read-only).
+    edit_buf: String,
+    /// Font size the job was built at (rebuilt on zoom).
     jobs_font: f32,
+}
+
+/// Merge the per-line highlighted jobs into one whole-document LayoutJob
+/// (uniform line height) whose text is every diff row joined by newlines.
+fn build_diff_doc(
+    hl: &Highlighter,
+    file: &str,
+    lines: &[crate::git::DiffLine],
+    font_size: f32,
+) -> (String, LayoutJob) {
+    let line_jobs = build_diff_jobs(hl, file, lines, font_size);
+    let lh = crate::highlight::line_height(font_size);
+    let plain_fmt = |color: Color32| {
+        let mut f = TextFormat::simple(FontId::monospace(font_size), color);
+        f.line_height = Some(lh);
+        f
+    };
+    let hunk_color = Color32::from_rgb(0x56, 0xb6, 0xc2);
+
+    let mut text = String::new();
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    for (i, dl) in lines.iter().enumerate() {
+        let base = text.len();
+        match line_jobs.get(i).and_then(|j| j.as_ref()) {
+            Some(lj) if !lj.text.is_empty() => {
+                text.push_str(&lj.text);
+                for sec in &lj.sections {
+                    job.sections.push(egui::text::LayoutSection {
+                        leading_space: 0.0,
+                        byte_range: (sec.byte_range.start + base)..(sec.byte_range.end + base),
+                        format: sec.format.clone(),
+                    });
+                }
+            }
+            _ => {
+                text.push_str(&dl.text);
+                if text.len() > base {
+                    let color = if dl.kind == crate::git::DiffKind::Hunk {
+                        hunk_color
+                    } else {
+                        C_TEXT
+                    };
+                    job.sections.push(egui::text::LayoutSection {
+                        leading_space: 0.0,
+                        byte_range: base..text.len(),
+                        format: plain_fmt(color),
+                    });
+                }
+            }
+        }
+        if i + 1 < lines.len() {
+            let b = text.len();
+            text.push('\n');
+            job.sections.push(egui::text::LayoutSection {
+                leading_space: 0.0,
+                byte_range: b..text.len(),
+                format: plain_fmt(C_TEXT),
+            });
+        }
+    }
+    job.text = text.clone();
+    (text, job)
 }
 
 /// Reconstruct the old/new documents from a unified diff, highlight each once
@@ -246,6 +323,54 @@ fn split_job_lines(doc: &str, job: &LayoutJob) -> Vec<LayoutJob> {
     out
 }
 
+/// Which view occupies the left side panel (IntelliJ tool-window strip).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeftView {
+    Project,
+    Commit,
+}
+
+/// Single status letter for changed-file lists.
+fn status_letter(s: crate::git::FileStatus) -> &'static str {
+    use crate::git::FileStatus::*;
+    match s {
+        Added => "A",
+        Untracked => "U",
+        Deleted => "D",
+        Renamed => "R",
+        Conflicted => "C",
+        _ => "M",
+    }
+}
+
+/// What the "Go to …" finder popup is currently searching over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FinderMode {
+    File,
+    Symbol,
+    Line,
+    Recent,
+}
+
+impl FinderMode {
+    fn title(&self) -> &'static str {
+        match self {
+            FinderMode::File => "파일로 이동",
+            FinderMode::Symbol => "심볼로 이동",
+            FinderMode::Line => "줄로 이동",
+            FinderMode::Recent => "최근 파일",
+        }
+    }
+    fn hint(&self) -> &'static str {
+        match self {
+            FinderMode::File => "파일 이름 입력",
+            FinderMode::Symbol => "심볼 이름 입력",
+            FinderMode::Line => "줄 번호 입력",
+            FinderMode::Recent => "필터 입력",
+        }
+    }
+}
+
 /// Everything that belongs to ONE opened project — its tree, open file tabs,
 /// git state, search state, symbol index, navigation history. The app keeps
 /// the active workspace in `CodeLookApp::ws` and parks the rest, so several
@@ -255,12 +380,25 @@ pub struct Workspace {
     seq: usize,
     project_root: Option<PathBuf>,
     tree: Option<TreeNode>,
+    /// One-shot: scroll the project tree to this path on the next frame
+    /// ("Select Opened File").
+    reveal_path: Option<PathBuf>,
     tabs: Vec<Tab>,
     active: Option<usize>,
     symbol_index: Option<SymbolIndex>,
-    index_rx: Option<Receiver<SymbolIndex>>,
+    index_rx: Option<Receiver<(SymbolIndex, Vec<PathBuf>)>>,
     indexing: bool,
     status: String,
+    /// All project files (from the index walk) — powers "Go to File".
+    files: Vec<PathBuf>,
+    /// Recently opened files, most recent first (capped).
+    recent: Vec<PathBuf>,
+    // "Go to …" finder popup (file / symbol / line / recent).
+    finder_open: bool,
+    finder_mode: FinderMode,
+    finder_query: String,
+    finder_sel: usize,
+    finder_focus: bool,
     // In-file search.
     search_open: bool,
     search_query: String,
@@ -300,7 +438,20 @@ pub struct Workspace {
     git_status: HashMap<PathBuf, crate::git::FileStatus>,
     git_branch: Option<String>,
     #[allow(clippy::type_complexity)]
-    git_rx: Option<Receiver<(HashMap<PathBuf, crate::git::FileStatus>, Option<String>)>>,
+    git_rx: Option<Receiver<(HashMap<PathBuf, crate::git::FileStatus>, Option<String>, usize, usize)>>,
+    // Branch switcher popup + running git CLI operation (checkout/pull/fetch).
+    branch_menu_open: bool,
+    branch_menu_pos: egui::Pos2,
+    branch_filter: String,
+    branch_focus: bool,
+    branches: Vec<crate::git::BranchInfo>,
+    git_op: Option<(String, Receiver<(bool, String)>)>,
+    // Ahead/behind vs upstream + the quiet background fetch that keeps the
+    // "↓ pull 필요" badge honest.
+    git_ahead: usize,
+    git_behind: usize,
+    autofetch_rx: Option<Receiver<(usize, usize)>>,
+    autofetch_at: Option<f64>,
     // Commit Log panel + diff viewer.
     log_open: bool,
     /// Commit-list / file-list split as a fraction of the panel width.
@@ -308,6 +459,10 @@ pub struct Workspace {
     commits: Vec<crate::git::CommitInfo>,
     commits_rx: Option<Receiver<Vec<crate::git::CommitInfo>>>,
     commit_sel: usize,
+    /// The pinned "변경사항 (커밋 전)" row is selected instead of a commit.
+    local_sel: bool,
+    /// Last periodic working-tree status refresh (while reviewing changes).
+    local_refresh_at: Option<f64>,
     commit_files: Vec<crate::git::FileChange>,
     commit_files_for: String,
     diff_view: Option<DiffView>,
@@ -319,12 +474,20 @@ impl Workspace {
             seq,
             project_root: None,
             tree: None,
+            reveal_path: None,
             tabs: Vec::new(),
             active: None,
             symbol_index: None,
             index_rx: None,
             indexing: false,
             status: String::new(),
+            files: Vec::new(),
+            recent: Vec::new(),
+            finder_open: false,
+            finder_mode: FinderMode::File,
+            finder_query: String::new(),
+            finder_sel: 0,
+            finder_focus: false,
             search_open: false,
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -358,11 +521,23 @@ impl Workspace {
             git_status: HashMap::new(),
             git_branch: None,
             git_rx: None,
+            branch_menu_open: false,
+            branch_menu_pos: egui::Pos2::ZERO,
+            branch_filter: String::new(),
+            branch_focus: false,
+            branches: Vec::new(),
+            git_op: None,
+            git_ahead: 0,
+            git_behind: 0,
+            autofetch_rx: None,
+            autofetch_at: None,
             log_open: false,
             log_split: 0.6,
             commits: Vec::new(),
             commits_rx: None,
             commit_sel: 0,
+            local_sel: false,
+            local_refresh_at: None,
             commit_files: Vec::new(),
             commit_files_for: String::new(),
             diff_view: None,
@@ -385,9 +560,19 @@ pub struct CodeLookApp {
     next_seq: usize,
     highlighter: Highlighter,
     font_size: f32,
+    // Configurable shortcuts + settings window state.
+    keymap: crate::keymap::Keymap,
+    settings_open: bool,
+    /// Action currently waiting for a new key chord in the settings window.
+    rebind: Option<crate::keymap::Action>,
     // Tool-window visibility toggles.
     tree_open: bool,
     structure_open: bool,
+    /// Which view the left panel shows (project tree / commit changes).
+    left_view: LeftView,
+    // Double-Shift (Search Everywhere) detection.
+    shift_prev: bool,
+    last_shift_at: f64,
     // IntelliJ expUI icon textures (files / folders / structure symbols).
     icons: icons::IconSet,
     // Capture mode (design-review loop); None in normal use.
@@ -421,6 +606,16 @@ impl CodeLookApp {
             next_seq: 1,
             highlighter: Highlighter::new(),
             font_size: 14.0,
+            keymap: cc
+                .storage
+                .and_then(|s| s.get_string("keymap"))
+                .map(|s| crate::keymap::Keymap::deserialize(&s))
+                .unwrap_or_else(crate::keymap::Keymap::default_map),
+            settings_open: false,
+            rebind: None,
+            left_view: LeftView::Project,
+            shift_prev: false,
+            last_shift_at: f64::NEG_INFINITY,
             tree_open: true,
             structure_open: true,
             icons: icons::IconSet::new(&cc.egui_ctx),
@@ -449,10 +644,31 @@ impl CodeLookApp {
             if let Some(root) = app.ws.project_root.clone() {
                 app.ws.git_status = crate::git::status_map(&root);
                 app.ws.git_branch = crate::git::current_branch(&root);
+                let (a, b) = crate::git::ahead_behind(&root).unwrap_or((0, 0));
+                app.ws.git_ahead = a;
+                app.ws.git_behind = b;
                 if s.log {
                     app.ws.log_open = true;
                     app.ws.commits = crate::git::commit_log(&root, 300);
-                    if !app.ws.commits.is_empty() {
+                    if !app.ws.git_status.is_empty() {
+                        // Dirty tree → show the Local Changes review view.
+                        app.ws.local_sel = true;
+                        let mut files: Vec<String> = app
+                            .ws
+                            .git_status
+                            .keys()
+                            .map(|p| {
+                                p.strip_prefix(&root)
+                                    .unwrap_or(p)
+                                    .to_string_lossy()
+                                    .to_string()
+                            })
+                            .collect();
+                        files.sort();
+                        if let Some(f) = files.first().cloned() {
+                            app.open_working_diff(f);
+                        }
+                    } else if !app.ws.commits.is_empty() {
                         app.select_commit(0);
                         if let Some(f) = app.ws.commit_files.first().cloned() {
                             app.open_commit_diff(f.path);
@@ -608,7 +824,8 @@ impl CodeLookApp {
         std::thread::spawn(move || {
             let status = crate::git::status_map(&gpath);
             let branch = crate::git::current_branch(&gpath);
-            let _ = gtx.send((status, branch));
+            let (ahead, behind) = crate::git::ahead_behind(&gpath).unwrap_or((0, 0));
+            let _ = gtx.send((status, branch, ahead, behind));
             ctx3.request_repaint();
         });
         self.ws.git_rx = Some(grx);
@@ -629,6 +846,9 @@ impl CodeLookApp {
     }
 
     fn open_file(&mut self, path: PathBuf) {
+        self.ws.recent.retain(|p| p != &path);
+        self.ws.recent.insert(0, path.clone());
+        self.ws.recent.truncate(30);
         if let Some(i) = self.ws.tabs.iter().position(|t| t.path == path) {
             self.ws.active = Some(i);
             self.ws.diff_view = None; // an open diff would keep covering the editor
@@ -693,6 +913,7 @@ impl CodeLookApp {
         if !self.can_back() {
             return;
         }
+        self.pin_current();
         self.ws.hist_pos -= 1;
         self.go_to_loc(self.ws.history[self.ws.hist_pos].clone());
     }
@@ -701,17 +922,67 @@ impl CodeLookApp {
         if !self.can_forward() {
             return;
         }
+        self.pin_current();
         self.ws.hist_pos += 1;
         self.go_to_loc(self.ws.history[self.ws.hist_pos].clone());
+    }
+
+    /// Where the user is right now: active tab + caret line (falling back to
+    /// the last jumped-to line).
+    fn current_loc(&self) -> Option<NavLoc> {
+        let i = self.ws.active?;
+        let t = self.ws.tabs.get(i)?;
+        Some(NavLoc {
+            path: t.path.clone(),
+            line: t.caret_line.or(t.flash_line).unwrap_or(0),
+        })
+    }
+
+    /// Record the exact current spot before a jump, so Back returns to where
+    /// the caret was (not merely to the previous jump target).
+    fn record_origin(&mut self) {
+        if let Some(loc) = self.current_loc() {
+            self.record_nav(loc.path, loc.line);
+        }
+    }
+
+    /// A plain editor click becomes a navigation point. Clicks within a few
+    /// lines of the current entry just refine its position; farther clicks
+    /// push a new entry (so Back walks click history like IntelliJ).
+    fn note_click_nav(&mut self, line: usize) {
+        let Some(path) = self
+            .ws
+            .active
+            .and_then(|i| self.ws.tabs.get(i))
+            .map(|t| t.path.clone())
+        else {
+            return;
+        };
+        if let Some(top) = self.ws.history.get_mut(self.ws.hist_pos) {
+            if top.path == path && top.line.abs_diff(line) < 5 {
+                top.line = line;
+                return;
+            }
+        }
+        self.record_nav(path, line);
+    }
+
+    /// Before moving through history, update the current entry's line to the
+    /// live caret position so Forward/Back return to the precise spot.
+    fn pin_current(&mut self) {
+        if let Some(loc) = self.current_loc() {
+            if let Some(entry) = self.ws.history.get_mut(self.ws.hist_pos) {
+                if entry.path == loc.path {
+                    entry.line = loc.line;
+                }
+            }
+        }
     }
 
     /// Navigate to a history location WITHOUT recording (avoids feedback loops).
     fn go_to_loc(&mut self, loc: NavLoc) {
         self.open_file(loc.path.clone());
-        if let Some(i) = self.ws.active {
-            self.ws.tabs[i].scroll_to_line = Some(loc.line);
-            self.ws.tabs[i].flash_line = Some(loc.line);
-        }
+        self.set_jump_target(loc.line);
     }
 
     // ---- Project-wide search ("Find in Files") -----------------------------
@@ -863,6 +1134,859 @@ impl CodeLookApp {
         }
     }
 
+    // ---- Keyboard shortcuts (configurable, see keymap.rs) -------------------
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        use crate::keymap::Action as A;
+        if self.keymap.pressed(ctx, A::FindInFile) && self.ws.active.is_some() {
+            self.ws.search_open = true;
+            self.ws.search_focus = true;
+        }
+        if self.keymap.pressed(ctx, A::FindInProject) && self.ws.project_root.is_some() {
+            self.ws.gsearch_open = true;
+            self.ws.gsearch_focus = true;
+            self.gsearch_warm(ctx);
+        }
+        if self.keymap.pressed(ctx, A::GoToFile) {
+            self.open_finder(FinderMode::File);
+        }
+        if self.keymap.pressed(ctx, A::GoToSymbol) {
+            self.open_finder(FinderMode::Symbol);
+        }
+        if self.keymap.pressed(ctx, A::GoToLine) && self.ws.active.is_some() {
+            self.open_finder(FinderMode::Line);
+        }
+        if self.keymap.pressed(ctx, A::RecentFiles) {
+            self.open_finder(FinderMode::Recent);
+        }
+        if self.keymap.pressed(ctx, A::GoToDeclaration) {
+            self.goto_declaration_at_caret();
+        }
+        if self.keymap.pressed(ctx, A::Back) {
+            self.nav_back();
+        }
+        if self.keymap.pressed(ctx, A::Forward) {
+            self.nav_forward();
+        }
+        if self.keymap.pressed(ctx, A::ToggleProject) {
+            self.tree_open = !self.tree_open;
+        }
+        if self.keymap.pressed(ctx, A::ToggleStructure) {
+            self.structure_open = !self.structure_open;
+        }
+        if self.keymap.pressed(ctx, A::ToggleCommits) {
+            self.toggle_log(ctx);
+        }
+        if self.keymap.pressed(ctx, A::CloseTab) {
+            self.close_active_tab();
+        }
+        if self.keymap.pressed(ctx, A::PrevTab) {
+            self.cycle_tab(-1);
+        }
+        if self.keymap.pressed(ctx, A::NextTab) {
+            self.cycle_tab(1);
+        }
+        if self.keymap.pressed(ctx, A::ZoomIn) {
+            self.zoom(1.0);
+        }
+        if self.keymap.pressed(ctx, A::ZoomOut) {
+            self.zoom(-1.0);
+        }
+    }
+
+    fn open_finder(&mut self, mode: FinderMode) {
+        if self.ws.project_root.is_none() {
+            return;
+        }
+        self.ws.finder_open = true;
+        self.ws.finder_mode = mode;
+        self.ws.finder_query.clear();
+        self.ws.finder_sel = 0;
+        self.ws.finder_focus = true;
+    }
+
+    fn close_active_tab(&mut self) {
+        if let Some(i) = self.ws.active {
+            self.ws.tabs.remove(i);
+            self.ws.active = if self.ws.tabs.is_empty() {
+                None
+            } else {
+                Some(i.min(self.ws.tabs.len() - 1))
+            };
+            self.refresh_search();
+        }
+    }
+
+    fn cycle_tab(&mut self, dir: isize) {
+        let n = self.ws.tabs.len();
+        if n < 2 {
+            return;
+        }
+        if let Some(a) = self.ws.active {
+            let next = (a as isize + dir).rem_euclid(n as isize) as usize;
+            self.record_origin();
+            self.ws.active = Some(next);
+            self.refresh_search();
+        }
+    }
+
+    fn zoom(&mut self, delta: f32) {
+        self.font_size = (self.font_size + delta).clamp(8.0, 40.0);
+        self.rehighlight_open_tabs();
+    }
+
+    /// ⌘B — go to the definition of the identifier under the caret.
+    fn goto_declaration_at_caret(&mut self) {
+        let word = self.ws.active.and_then(|i| self.ws.tabs.get(i)).and_then(|t| {
+            t.caret_ci.and_then(|ci| word_at(&t.content, ci))
+        });
+        if let Some(w) = word {
+            self.goto_definition(&w);
+        }
+    }
+
+    /// "Go to …" finder popup (file / symbol / line / recent).
+    fn finder_window(&mut self, ctx: &egui::Context) {
+        if !self.ws.finder_open {
+            return;
+        }
+        let (up, down, enter) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::ArrowUp),
+                i.key_pressed(Key::ArrowDown),
+                i.key_pressed(Key::Enter),
+            )
+        });
+
+        // Collect matches: (label, dim detail, target path, target line).
+        let query = self.ws.finder_query.trim().to_string();
+        let ql = query.to_lowercase();
+        let root = self.ws.project_root.clone().unwrap_or_default();
+        let mut results: Vec<(String, String, Option<PathBuf>, Option<usize>)> = Vec::new();
+        const CAP: usize = 100;
+        match self.ws.finder_mode {
+            FinderMode::File | FinderMode::Recent => {
+                let list: Vec<&PathBuf> = match self.ws.finder_mode {
+                    FinderMode::Recent => self.ws.recent.iter().collect(),
+                    _ => self.ws.files.iter().collect(),
+                };
+                // Name matches first, then path-only matches.
+                let mut by_path: Vec<&PathBuf> = Vec::new();
+                for p in list {
+                    if results.len() >= CAP {
+                        break;
+                    }
+                    let name = p.file_name().unwrap_or_default().to_string_lossy();
+                    let rel = p.strip_prefix(&root).unwrap_or(p).to_string_lossy();
+                    if ql.is_empty() || name.to_lowercase().contains(&ql) {
+                        results.push((name.to_string(), rel.to_string(), Some((*p).clone()), None));
+                    } else if rel.to_lowercase().contains(&ql) {
+                        by_path.push(p);
+                    }
+                }
+                for p in by_path {
+                    if results.len() >= CAP {
+                        break;
+                    }
+                    let name = p.file_name().unwrap_or_default().to_string_lossy();
+                    let rel = p.strip_prefix(&root).unwrap_or(p).to_string_lossy();
+                    results.push((name.to_string(), rel.to_string(), Some(p.clone()), None));
+                }
+            }
+            FinderMode::Symbol => {
+                if !ql.is_empty() {
+                    if let Some(idx) = &self.ws.symbol_index {
+                        let mut names: Vec<&String> =
+                            idx.keys().filter(|n| n.to_lowercase().contains(&ql)).collect();
+                        // Shorter names (closer matches) first.
+                        names.sort_by_key(|n| (n.len(), (*n).clone()));
+                        'outer: for name in names {
+                            for loc in &idx[name] {
+                                let rel = loc.path.strip_prefix(&root).unwrap_or(&loc.path);
+                                results.push((
+                                    name.clone(),
+                                    format!("{}:{}", rel.to_string_lossy(), loc.line + 1),
+                                    Some(loc.path.clone()),
+                                    Some(loc.line),
+                                ));
+                                if results.len() >= CAP {
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            FinderMode::Line => {
+                if let Some(t) = self.ws.active.and_then(|i| self.ws.tabs.get(i)) {
+                    if let Ok(n) = query.parse::<usize>() {
+                        let line = n.clamp(1, t.line_count);
+                        results.push((
+                            format!("{line}번째 줄로 이동"),
+                            t.path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                            Some(t.path.clone()),
+                            Some(line - 1),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let n = results.len();
+        if n > 0 {
+            if down {
+                self.ws.finder_sel = (self.ws.finder_sel + 1).min(n - 1);
+            }
+            if up {
+                self.ws.finder_sel = self.ws.finder_sel.saturating_sub(1);
+            }
+        }
+        self.ws.finder_sel = self.ws.finder_sel.min(n.saturating_sub(1));
+        let mut navigate: Option<(PathBuf, Option<usize>)> = None;
+        if enter {
+            if let Some((_, _, Some(p), line)) = results.get(self.ws.finder_sel) {
+                navigate = Some((p.clone(), *line));
+            }
+        }
+
+        let title = self.ws.finder_mode.title();
+        let hint = self.ws.finder_mode.hint();
+        let mut keep_open = true;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([620.0, 420.0])
+            .anchor(Align2::CENTER_TOP, [0.0, 90.0])
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(C_PANEL)
+                    .stroke(Stroke::new(1.0, C_BORDER))
+                    .inner_margin(10.0),
+            )
+            .open(&mut keep_open)
+            .show(ctx, |ui| {
+                let fresp = ui.add(
+                    egui::TextEdit::singleline(&mut self.ws.finder_query)
+                        .hint_text(hint)
+                        .desired_width(f32::INFINITY)
+                        .font(FontId::proportional(14.0)),
+                );
+                if self.ws.finder_focus {
+                    fresp.request_focus();
+                    self.ws.finder_focus = false;
+                }
+                if fresp.changed() {
+                    self.ws.finder_sel = 0;
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                let sel = self.ws.finder_sel;
+                egui::ScrollArea::vertical()
+                    .id_salt(("finder_list", self.ws.seq))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for (idx, (label, detail, path, line)) in results.iter().enumerate() {
+                            let (rr, rresp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 26.0),
+                                Sense::click(),
+                            );
+                            if !ui.is_rect_visible(rr) {
+                                if rresp.clicked() {
+                                    navigate = path.clone().map(|p| (p, *line));
+                                }
+                                continue;
+                            }
+                            let p = ui.painter();
+                            if idx == sel {
+                                p.rect_filled(rr, 0.0, C_SEL);
+                            } else if rresp.hovered() {
+                                p.rect_filled(rr, 0.0, C_HOVER);
+                            }
+                            if let Some(fp) = path {
+                                let badge = Rect::from_center_size(
+                                    egui::pos2(rr.left() + 14.0, rr.center().y),
+                                    Vec2::splat(15.0),
+                                );
+                                self.icons.file(
+                                    p,
+                                    badge,
+                                    &fp.file_name().unwrap_or_default().to_string_lossy(),
+                                );
+                            }
+                            p.text(
+                                egui::pos2(rr.left() + 28.0, rr.center().y),
+                                Align2::LEFT_CENTER,
+                                label,
+                                FontId::proportional(13.5),
+                                if idx == sel { Color32::WHITE } else { C_TEXT },
+                            );
+                            p.text(
+                                egui::pos2(rr.right() - 8.0, rr.center().y),
+                                Align2::RIGHT_CENTER,
+                                detail,
+                                FontId::proportional(11.5),
+                                C_TEXT_DIM,
+                            );
+                            if rresp.clicked() {
+                                navigate = path.clone().map(|p| (p, *line));
+                            }
+                            if (up || down) && idx == sel {
+                                ui.scroll_to_rect(rr, Some(Align::Center));
+                            }
+                        }
+                        if results.is_empty() && !ql.is_empty() {
+                            ui.add_space(16.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(egui::RichText::new("결과 없음").color(C_TEXT_DIM));
+                            });
+                        }
+                    });
+            });
+
+        if let Some((path, line)) = navigate {
+            self.ws.finder_open = false;
+            match line {
+                Some(l) => self.navigate_to(path, l),
+                None => {
+                    self.record_origin();
+                    self.open_file(path.clone());
+                    self.record_nav(path, 0);
+                }
+            }
+        } else {
+            self.ws.finder_open = keep_open && self.ws.finder_open;
+        }
+    }
+
+    /// Settings window: the editable keymap.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            self.rebind = None;
+            return;
+        }
+        // While rebinding, the next non-modifier key press becomes the chord.
+        if let Some(action) = self.rebind {
+            let captured = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => Some((*key, *modifiers)),
+                    _ => None,
+                })
+            });
+            if let Some((key, mods)) = captured {
+                if key == Key::Escape {
+                    self.rebind = None;
+                } else {
+                    self.keymap.set(action, crate::keymap::Chord::new(mods, key));
+                    self.rebind = None;
+                }
+            }
+        }
+
+        let mut keep_open = true;
+        let mut reset_all = false;
+        egui::Window::new("설정 · 단축키")
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([460.0, 560.0])
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(C_PANEL)
+                    .stroke(Stroke::new(1.0, C_BORDER))
+                    .inner_margin(12.0),
+            )
+            .open(&mut keep_open)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("단축키를 클릭한 뒤 새 키 조합을 누르세요 (Esc 취소)")
+                        .color(C_TEXT_DIM)
+                        .size(12.0),
+                );
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("keymap_list")
+                    .max_height(440.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for &action in crate::keymap::ACTIONS {
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [250.0, 24.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(action.label()).size(13.0),
+                                    ),
+                                );
+                                let rebinding = self.rebind == Some(action);
+                                let chord = self.keymap.get(action);
+                                let dup = !self.keymap.conflicts(action, chord).is_empty();
+                                let text = if rebinding {
+                                    egui::RichText::new("키 입력 대기…").color(C_ACCENT)
+                                } else if dup {
+                                    egui::RichText::new(chord.text())
+                                        .color(Color32::from_rgb(0xe0, 0x6c, 0x75))
+                                } else {
+                                    egui::RichText::new(chord.text()).color(C_TEXT)
+                                };
+                                let b = ui.add_sized([120.0, 24.0], egui::Button::new(text));
+                                let b = if dup {
+                                    b.on_hover_text("다른 동작과 겹칩니다")
+                                } else {
+                                    b
+                                };
+                                if b.clicked() {
+                                    self.rebind = Some(action);
+                                }
+                            });
+                        }
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("기본값 복원").clicked() {
+                        reset_all = true;
+                    }
+                });
+            });
+        if reset_all {
+            self.keymap = crate::keymap::Keymap::default_map();
+            self.rebind = None;
+        }
+        self.settings_open = keep_open;
+    }
+
+    // ---- Git operations (checkout / pull / fetch via the git CLI) ----------
+
+    /// Run a git subcommand on a background thread. One at a time per project.
+    fn git_op(&mut self, ctx: &egui::Context, label: &str, args: Vec<String>) {
+        if self.ws.git_op.is_some() {
+            return;
+        }
+        let Some(root) = self.ws.project_root.clone() else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let result = crate::git::run_git(&root, &args);
+            let _ = tx.send(result);
+            c.request_repaint();
+        });
+        self.ws.git_op = Some((label.to_string(), rx));
+    }
+
+    /// Collect a finished git operation: report one line in the status bar
+    /// and reload project state on success.
+    fn git_op_poll(&mut self, ctx: &egui::Context) {
+        let done = match &self.ws.git_op {
+            Some((label, rx)) => rx.try_recv().ok().map(|r| (label.clone(), r)),
+            None => None,
+        };
+        let Some((label, (ok, msg))) = done else {
+            return;
+        };
+        self.ws.git_op = None;
+        let line = msg
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or(if ok { "완료" } else { "실패" });
+        self.ws.status = format!("git {label}: {line}");
+        if ok {
+            self.reload_after_git(ctx);
+        }
+    }
+
+    /// Refresh everything that may have changed on disk after a checkout /
+    /// pull: tree (expansion preserved), open tabs, git state, commit log,
+    /// symbol index. The search snapshot revalidates itself by mtime.
+    fn reload_after_git(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.ws.project_root.clone() else {
+            return;
+        };
+
+        // Project tree, keeping currently expanded folders open.
+        let mut expanded = std::collections::HashSet::new();
+        if let Some(t) = &self.ws.tree {
+            collect_expanded(t, &mut expanded);
+        }
+        let mut new_root = TreeNode::new(root.clone(), true);
+        new_root.expanded = true;
+        new_root.children = Some(load_children(&root));
+        apply_expanded(&mut new_root, &expanded);
+        self.ws.tree = Some(new_root);
+
+        // Open tabs: drop deleted files, rebuild changed ones in place.
+        let active_path = self.ws.active.and_then(|i| self.ws.tabs.get(i)).map(|t| t.path.clone());
+        let mut rebuilt = Vec::with_capacity(self.ws.tabs.len());
+        for tab in self.ws.tabs.drain(..) {
+            match std::fs::read_to_string(&tab.path) {
+                Ok(content) if content != tab.content => {
+                    let job = self.highlighter.highlight(
+                        tab.path.to_str().unwrap_or(""),
+                        &content,
+                        self.font_size,
+                    );
+                    let lang = ast::Lang::from_path(&tab.path);
+                    let outline = lang
+                        .map(|l| ast::document_symbols(l, &content))
+                        .unwrap_or_default();
+                    let mut t = Tab::new(tab.path, content, job, self.font_size, lang, outline);
+                    t.git_changes =
+                        crate::git::file_line_changes(&root, &t.path).unwrap_or_default();
+                    rebuilt.push(t);
+                }
+                Ok(_) => {
+                    let mut t = tab;
+                    t.git_changes =
+                        crate::git::file_line_changes(&root, &t.path).unwrap_or_default();
+                    rebuilt.push(t);
+                }
+                Err(_) => {} // file no longer exists on this branch
+            }
+        }
+        self.ws.tabs = rebuilt;
+        self.ws.active = active_path
+            .and_then(|p| self.ws.tabs.iter().position(|t| t.path == p))
+            .or(if self.ws.tabs.is_empty() { None } else { Some(0) });
+        self.refresh_search();
+
+        // Git status + branch (background), commit log, symbol index.
+        let (gtx, grx) = std::sync::mpsc::channel();
+        let (c, p) = (ctx.clone(), root.clone());
+        std::thread::spawn(move || {
+            let (ahead, behind) = crate::git::ahead_behind(&p).unwrap_or((0, 0));
+            let _ = gtx.send((
+                crate::git::status_map(&p),
+                crate::git::current_branch(&p),
+                ahead,
+                behind,
+            ));
+            c.request_repaint();
+        });
+        self.ws.git_rx = Some(grx);
+
+        self.ws.commits.clear();
+        self.ws.commit_files.clear();
+        self.ws.commit_files_for.clear();
+        self.ws.commit_sel = 0;
+        self.ws.diff_view = None;
+        if self.ws.log_open {
+            let (ltx, lrx) = std::sync::mpsc::channel();
+            let (c, p) = (ctx.clone(), root.clone());
+            std::thread::spawn(move || {
+                let _ = ltx.send(crate::git::commit_log(&p, 300));
+                c.request_repaint();
+            });
+            self.ws.commits_rx = Some(lrx);
+        }
+
+        let (itx, irx) = std::sync::mpsc::channel();
+        let (c, p) = (ctx.clone(), root);
+        std::thread::spawn(move || {
+            let _ = itx.send(symbols::build_index(&p));
+            c.request_repaint();
+        });
+        self.ws.index_rx = Some(irx);
+        self.ws.indexing = true;
+    }
+
+    /// "Select Opened File": expand every ancestor of the active tab's file
+    /// and scroll the project tree to it.
+    fn reveal_active_file(&mut self) {
+        let Some(path) = self
+            .ws
+            .active
+            .and_then(|i| self.ws.tabs.get(i))
+            .map(|t| t.path.clone())
+        else {
+            return;
+        };
+        let Some(root) = self.ws.project_root.clone() else {
+            return;
+        };
+        let mut ancestors = std::collections::HashSet::new();
+        let mut p = path.parent();
+        while let Some(d) = p {
+            ancestors.insert(d.to_path_buf());
+            if d == root {
+                break;
+            }
+            p = d.parent();
+        }
+        if let Some(tree) = &mut self.ws.tree {
+            apply_expanded(tree, &ancestors);
+        }
+        self.left_view = LeftView::Project;
+        self.tree_open = true;
+        self.ws.reveal_path = Some(path);
+    }
+
+    /// Left tool-window header with the branch control on the right:
+    /// ⑂ branch-name, ↓N when the remote has new commits (pull needed),
+    /// ↑M when local is ahead. Click opens the branch switcher.
+    fn left_header(&mut self, ui: &mut egui::Ui, title: &str, locate: bool) {
+        let full_w = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(full_w, 28.0), Sense::hover());
+        let p = ui.painter();
+        let title_g = p.layout_no_wrap(
+            title.to_string(),
+            FontId::proportional(11.5),
+            C_HEADER,
+        );
+        p.galley(
+            egui::pos2(rect.left() + 12.0, rect.center().y - title_g.size().y / 2.0),
+            title_g.clone(),
+            C_HEADER,
+        );
+        // "Select Opened File" — crosshair right after the title.
+        if locate && self.ws.active.is_some() {
+            let center = egui::pos2(
+                rect.left() + 12.0 + title_g.size().x + 16.0,
+                rect.center().y,
+            );
+            let r = Rect::from_center_size(center, Vec2::splat(18.0));
+            let resp = ui.interact(r, ui.id().with("locate_btn"), Sense::click());
+            let c = if resp.hovered() { C_TEXT } else { C_TEXT_DIM };
+            if resp.hovered() {
+                p.rect_filled(r, 4.0, C_HOVER);
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            p.circle_stroke(center, 4.5, Stroke::new(1.3, c));
+            p.circle_filled(center, 1.4, c);
+            for (dx, dy) in [(0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)] {
+                let v = Vec2::new(dx, dy);
+                p.line_segment(
+                    [center + v * 4.5, center + v * 7.0],
+                    Stroke::new(1.3, c),
+                );
+            }
+            if resp.on_hover_text("열린 파일 위치 찾기").clicked() {
+                self.reveal_active_file();
+            }
+        }
+        p.line_segment(
+            [
+                egui::pos2(rect.left(), rect.bottom() - 0.5),
+                egui::pos2(rect.right(), rect.bottom() - 0.5),
+            ],
+            Stroke::new(1.0, C_BORDER),
+        );
+
+        let Some(branch) = self.ws.git_branch.clone() else {
+            return;
+        };
+        let font = FontId::proportional(12.0);
+        let cy = rect.center().y;
+
+        // Compose the chip text, truncating the branch name to fit the panel.
+        let op_running = self.ws.git_op.is_some();
+        let mut suffix = String::new();
+        if self.ws.git_behind > 0 {
+            suffix.push_str(&format!("  ↓{}", self.ws.git_behind));
+        }
+        if self.ws.git_ahead > 0 {
+            suffix.push_str(&format!("  ↑{}", self.ws.git_ahead));
+        }
+        let max_w = full_w - 90.0; // leave room for the PROJECT title
+        let mut name = branch.clone();
+        let text_of = |n: &str, s: &str| format!("{n}{s}");
+        let width = |t: &str, ui: &egui::Ui| {
+            ui.fonts(|f| f.layout_no_wrap(t.to_string(), font.clone(), C_TEXT).size().x)
+        };
+        while name.chars().count() > 8 && width(&text_of(&name, &suffix), ui) + 22.0 > max_w {
+            let mut cs: Vec<char> = name.chars().collect();
+            cs.truncate(cs.len().saturating_sub(2));
+            name = cs.into_iter().collect::<String>() + "…";
+        }
+        let label = text_of(&name, &suffix);
+        let text_w = width(&label, ui);
+
+        let chip = Rect::from_min_max(
+            egui::pos2(rect.right() - text_w - 26.0, rect.top() + 3.0),
+            egui::pos2(rect.right() - 4.0, rect.bottom() - 4.0),
+        );
+        let resp = ui.interact(chip, ui.id().with("branch_chip"), Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            p.rect_filled(chip, 4.0, C_HOVER);
+        }
+        let col = if resp.hovered() { C_TEXT } else { C_TEXT_DIM };
+        // Accent-colored icon doubles as the "operation running" indicator.
+        draw_branch_icon(
+            p,
+            egui::pos2(chip.left() + 8.0, cy),
+            if op_running { C_ACCENT } else { col },
+        );
+        // Name in the base color, ↓/↑ counters accented.
+        let mut x = chip.left() + 16.0;
+        let g = p.layout_no_wrap(name, font.clone(), col);
+        p.galley(egui::pos2(x, cy - g.size().y / 2.0), g.clone(), col);
+        x += g.size().x;
+        if self.ws.git_behind > 0 {
+            let g = p.layout_no_wrap(format!("  ↓{}", self.ws.git_behind), font.clone(), C_ACCENT);
+            p.galley(egui::pos2(x, cy - g.size().y / 2.0), g.clone(), C_ACCENT);
+            x += g.size().x;
+        }
+        if self.ws.git_ahead > 0 {
+            let green = Color32::from_rgb(0x62, 0xb5, 0x43);
+            let g = p.layout_no_wrap(format!("  ↑{}", self.ws.git_ahead), font.clone(), green);
+            p.galley(egui::pos2(x, cy - g.size().y / 2.0), g, green);
+        }
+        let resp = if self.ws.git_behind > 0 {
+            resp.on_hover_text(format!(
+                "원격에 새 커밋 {}개 — Pull 필요",
+                self.ws.git_behind
+            ))
+        } else {
+            resp.on_hover_text("브랜치 전환 / Pull / Fetch")
+        };
+        if resp.clicked() {
+            self.ws.branch_menu_open = true;
+            self.ws.branch_menu_pos = egui::pos2(chip.left().min(rect.right() - 348.0), rect.bottom() + 4.0);
+            self.ws.branch_focus = true;
+            self.ws.branch_filter.clear();
+            if let Some(root) = &self.ws.project_root {
+                self.ws.branches = crate::git::branches(root);
+            }
+        }
+    }
+
+    /// Branch switcher popup (anchored under the PROJECT-header branch chip).
+    fn branch_menu(&mut self, ctx: &egui::Context) {
+        if !self.ws.branch_menu_open {
+            return;
+        }
+        let op_running = self.ws.git_op.is_some();
+        let mut checkout: Option<String> = None;
+        let mut do_pull = false;
+        let mut do_fetch = false;
+        let mut keep_open = true;
+
+        let resp = egui::Window::new("branch_menu")
+            .title_bar(false)
+            .resizable(false)
+            .fixed_size([340.0, 420.0])
+            .fixed_pos(self.ws.branch_menu_pos)
+            .pivot(Align2::LEFT_TOP)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(C_PANEL)
+                    .stroke(Stroke::new(1.0, C_BORDER))
+                    .inner_margin(8.0),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!op_running, egui::Button::new("Pull ↓"))
+                        .on_hover_text("git pull --ff-only")
+                        .clicked()
+                    {
+                        do_pull = true;
+                    }
+                    if ui
+                        .add_enabled(!op_running, egui::Button::new("Fetch"))
+                        .on_hover_text("git fetch --prune")
+                        .clicked()
+                    {
+                        do_fetch = true;
+                    }
+                    if op_running {
+                        ui.label(egui::RichText::new("작업 중…").color(C_TEXT_DIM).size(12.0));
+                    }
+                });
+                ui.add_space(6.0);
+                let fresp = ui.add(
+                    egui::TextEdit::singleline(&mut self.ws.branch_filter)
+                        .hint_text("브랜치 검색 (클릭 = 체크아웃)")
+                        .desired_width(f32::INFINITY),
+                );
+                if self.ws.branch_focus {
+                    fresp.request_focus();
+                    self.ws.branch_focus = false;
+                }
+                ui.add_space(4.0);
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt(("branch_list", self.ws.seq))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let filt = self.ws.branch_filter.to_lowercase();
+                        for b in &self.ws.branches {
+                            if !filt.is_empty() && !b.name.to_lowercase().contains(&filt) {
+                                continue;
+                            }
+                            let (rr, rresp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 24.0),
+                                Sense::click(),
+                            );
+                            let p = ui.painter();
+                            if b.is_current {
+                                p.rect_filled(rr, 0.0, C_SEL);
+                            } else if rresp.hovered() {
+                                p.rect_filled(rr, 0.0, C_HOVER);
+                            }
+                            draw_branch_icon(
+                                p,
+                                egui::pos2(rr.left() + 12.0, rr.center().y),
+                                if b.is_current { C_ACCENT } else { C_TEXT_DIM },
+                            );
+                            p.text(
+                                egui::pos2(rr.left() + 24.0, rr.center().y),
+                                Align2::LEFT_CENTER,
+                                &b.name,
+                                FontId::proportional(13.0),
+                                if b.is_current {
+                                    Color32::WHITE
+                                } else if b.is_remote {
+                                    C_TEXT_DIM
+                                } else {
+                                    C_TEXT
+                                },
+                            );
+                            if b.is_remote {
+                                p.text(
+                                    egui::pos2(rr.right() - 8.0, rr.center().y),
+                                    Align2::RIGHT_CENTER,
+                                    "remote",
+                                    FontId::proportional(11.0),
+                                    C_TEXT_DIM,
+                                );
+                            }
+                            if rresp.clicked() && !b.is_current && !op_running {
+                                checkout = Some(b.name.clone());
+                            }
+                        }
+                    });
+            });
+
+        if let Some(r) = &resp {
+            if r.response.clicked_elsewhere() {
+                keep_open = false;
+            }
+        }
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            keep_open = false;
+        }
+        if let Some(name) = checkout {
+            keep_open = false;
+            self.git_op(ctx, "checkout", vec!["checkout".into(), name]);
+        }
+        if do_pull {
+            self.git_op(ctx, "pull", vec!["pull".into(), "--ff-only".into()]);
+        }
+        if do_fetch {
+            self.git_op(ctx, "fetch", vec!["fetch".into(), "--prune".into()]);
+        }
+        self.ws.branch_menu_open = keep_open;
+    }
+
     // ---- Commit log / diff -------------------------------------------------
 
     fn toggle_log(&mut self, ctx: &egui::Context) {
@@ -883,6 +2007,7 @@ impl CodeLookApp {
 
     /// Select a commit and load its changed-file list (synchronously).
     fn select_commit(&mut self, idx: usize) {
+        self.ws.local_sel = false;
         self.ws.commit_sel = idx;
         if let (Some(root), Some(c)) = (self.ws.project_root.clone(), self.ws.commits.get(idx).cloned()) {
             self.ws.commit_files = crate::git::commit_files(&root, &c.id);
@@ -896,25 +2021,79 @@ impl CodeLookApp {
             (self.ws.project_root.clone(), self.ws.commits.get(self.ws.commit_sel).cloned())
         {
             let lines = crate::git::commit_file_diff(&root, &c.id, &file);
-            let jobs = build_diff_jobs(&self.highlighter, &file, &lines, self.font_size);
+            let (text, job) = build_diff_doc(&self.highlighter, &file, &lines, self.font_size);
             self.ws.diff_view = Some(DiffView {
                 commit_short: c.short.clone(),
                 file,
                 lines,
-                jobs,
+                edit_buf: text.clone(),
+                text,
+                job,
                 jobs_font: self.font_size,
             });
         }
     }
 
+    /// Open the diff of one file's uncommitted changes (HEAD vs working tree).
+    fn open_working_diff(&mut self, file: String) {
+        if let Some(root) = self.ws.project_root.clone() {
+            let lines = crate::git::working_file_diff(&root, &file);
+            let (text, job) = build_diff_doc(&self.highlighter, &file, &lines, self.font_size);
+            self.ws.diff_view = Some(DiffView {
+                commit_short: "변경사항".into(),
+                file,
+                lines,
+                edit_buf: text.clone(),
+                text,
+                job,
+                jobs_font: self.font_size,
+            });
+        }
+    }
+
+    /// Refresh the working-tree status (and branch / ahead-behind) in the
+    /// background — used when reviewing uncommitted changes.
+    fn refresh_git_status(&mut self, ctx: &egui::Context) {
+        if self.ws.git_rx.is_some() {
+            return;
+        }
+        let Some(root) = self.ws.project_root.clone() else {
+            return;
+        };
+        self.ws.local_refresh_at = Some(ctx.input(|i| i.time));
+        let (gtx, grx) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let (ahead, behind) = crate::git::ahead_behind(&root).unwrap_or((0, 0));
+            let _ = gtx.send((
+                crate::git::status_map(&root),
+                crate::git::current_branch(&root),
+                ahead,
+                behind,
+            ));
+            c.request_repaint();
+        });
+        self.ws.git_rx = Some(grx);
+    }
+
     /// Open a file at a line, recording it in the nav history.
     fn navigate_to(&mut self, path: PathBuf, line: usize) {
+        self.record_origin();
         self.open_file(path.clone());
-        if let Some(i) = self.ws.active {
-            self.ws.tabs[i].scroll_to_line = Some(line);
-            self.ws.tabs[i].flash_line = Some(line);
-        }
+        self.set_jump_target(line);
         self.record_nav(path, line);
+    }
+
+    /// Scroll/flash the active tab to a jumped-to line and move the tracked
+    /// caret there, so the history sees the destination as "current".
+    fn set_jump_target(&mut self, line: usize) {
+        if let Some(i) = self.ws.active {
+            let t = &mut self.ws.tabs[i];
+            t.scroll_to_line = Some(line);
+            t.flash_line = Some(line);
+            t.caret_line = Some(line);
+            t.caret_ci = None;
+        }
     }
 
     fn goto_definition(&mut self, name: &str) {
@@ -963,11 +2142,9 @@ impl CodeLookApp {
             .cloned()
             .unwrap();
 
+        self.record_origin();
         self.open_file(pick.path.clone());
-        if let Some(i) = self.ws.active {
-            self.ws.tabs[i].scroll_to_line = Some(pick.line);
-            self.ws.tabs[i].flash_line = Some(pick.line);
-        }
+        self.set_jump_target(pick.line);
         self.record_nav(pick.path.clone(), pick.line);
 
         let where_ = pick
@@ -1081,6 +2258,7 @@ impl eframe::App for CodeLookApp {
             "open_projects",
             all.into_iter().map(|(_, p)| p).collect::<Vec<_>>().join("\n"),
         );
+        storage.set_string("keymap", self.keymap.serialize());
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1089,9 +2267,10 @@ impl eframe::App for CodeLookApp {
         }
 
         if let Some(rx) = &self.ws.index_rx {
-            if let Ok(idx) = rx.try_recv() {
+            if let Ok((idx, files)) = rx.try_recv() {
                 let count = idx.len();
                 self.ws.symbol_index = Some(idx);
+                self.ws.files = files;
                 self.ws.indexing = false;
                 self.ws.index_rx = None;
                 self.ws.status = format!("인덱싱 완료 · 심볼 {count}개");
@@ -1099,10 +2278,45 @@ impl eframe::App for CodeLookApp {
         }
 
         if let Some(rx) = &self.ws.git_rx {
-            if let Ok((status, branch)) = rx.try_recv() {
+            if let Ok((status, branch, ahead, behind)) = rx.try_recv() {
                 self.ws.git_status = status;
                 self.ws.git_branch = branch;
+                self.ws.git_ahead = ahead;
+                self.ws.git_behind = behind;
                 self.ws.git_rx = None;
+            }
+        }
+
+        // Quiet background fetch keeps the ↓ badge honest (per active project,
+        // at most every 5 minutes, never while a git op runs).
+        if let Some(rx) = &self.ws.autofetch_rx {
+            if let Ok((ahead, behind)) = rx.try_recv() {
+                self.ws.git_ahead = ahead;
+                self.ws.git_behind = behind;
+                self.ws.autofetch_rx = None;
+            }
+        } else if self.ws.git_branch.is_some()
+            && self.ws.git_op.is_none()
+            && self.shot.is_none()
+            && {
+                let now = ctx.input(|i| i.time);
+                self.ws.autofetch_at.is_none_or(|t| now - t > 300.0)
+            }
+        {
+            if let Some(root) = self.ws.project_root.clone() {
+                self.ws.autofetch_at = Some(ctx.input(|i| i.time));
+                let (tx, rx) = std::sync::mpsc::channel();
+                let c = ctx.clone();
+                std::thread::spawn(move || {
+                    let _ = crate::git::run_git(
+                        &root,
+                        &["fetch".to_string(), "--prune".to_string(), "-q".to_string()],
+                    );
+                    let ab = crate::git::ahead_behind(&root).unwrap_or((0, 0));
+                    let _ = tx.send(ab);
+                    c.request_repaint();
+                });
+                self.ws.autofetch_rx = Some(rx);
             }
         }
 
@@ -1113,47 +2327,78 @@ impl eframe::App for CodeLookApp {
                 if !self.ws.commits.is_empty() {
                     self.select_commit(0);
                 }
+                // With uncommitted changes present, start on the review view.
+                if !self.ws.git_status.is_empty() {
+                    self.ws.local_sel = true;
+                }
             }
+        }
+
+        // While reviewing uncommitted changes (bottom-panel row or the left
+        // Commit view), keep the file list fresh — files may be edited
+        // outside, e.g. by an agent in a terminal.
+        let reviewing = (self.ws.log_open && self.ws.local_sel)
+            || (self.tree_open && self.left_view == LeftView::Commit);
+        if reviewing && self.shot.is_none() {
+            let now = ctx.input(|i| i.time);
+            if self.ws.local_refresh_at.is_none_or(|t| now - t > 5.0) {
+                self.refresh_git_status(ctx);
+            }
+        }
+
+        // Double-Shift → Search Everywhere (파일로 이동), IntelliJ style.
+        {
+            let (shift_down, only_shift, other_key, t) = ctx.input(|i| {
+                (
+                    i.modifiers.shift,
+                    i.modifiers == egui::Modifiers::SHIFT,
+                    i.events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::Key { pressed: true, .. })),
+                    i.time,
+                )
+            });
+            if other_key {
+                self.last_shift_at = f64::NEG_INFINITY; // real key between shifts cancels
+            }
+            if shift_down && !self.shift_prev && only_shift && !self.settings_open {
+                if t - self.last_shift_at < 0.4 {
+                    self.last_shift_at = f64::NEG_INFINITY;
+                    self.open_finder(FinderMode::File);
+                } else {
+                    self.last_shift_at = t;
+                }
+            }
+            self.shift_prev = shift_down;
         }
 
         // Keyboard: ⌘F open search, Esc closes it.
         // Navigation (IntelliJ macOS keymap): Back = ⌘[ or ⌥⌘← ; Forward = ⌘] or
         // ⌥⌘→ ; plus the mouse Back/Forward side buttons.
-        let (open_find, open_gfind, esc, back, forward) = ctx.input(|i| {
-            let cmd = i.modifiers.command || i.modifiers.ctrl;
-            let alt = i.modifiers.alt;
-            let shift = i.modifiers.shift;
-            let back = (cmd && i.key_pressed(Key::OpenBracket))
-                || (cmd && alt && i.key_pressed(Key::ArrowLeft))
-                || i.pointer.button_pressed(egui::PointerButton::Extra1);
-            let forward = (cmd && i.key_pressed(Key::CloseBracket))
-                || (cmd && alt && i.key_pressed(Key::ArrowRight))
-                || i.pointer.button_pressed(egui::PointerButton::Extra2);
+        // Hardware / legacy navigation inputs (not part of the keymap).
+        let (mouse_back, mouse_fwd, alt_back, alt_fwd, esc) = ctx.input(|i| {
+            let cmd_alt = (i.modifiers.command || i.modifiers.ctrl) && i.modifiers.alt;
             (
-                cmd && !shift && i.key_pressed(Key::F),
-                cmd && shift && i.key_pressed(Key::F),
+                i.pointer.button_pressed(egui::PointerButton::Extra1),
+                i.pointer.button_pressed(egui::PointerButton::Extra2),
+                cmd_alt && i.key_pressed(Key::ArrowLeft),
+                cmd_alt && i.key_pressed(Key::ArrowRight),
                 i.key_pressed(Key::Escape),
-                back,
-                forward,
             )
         });
-        if open_find && self.ws.active.is_some() {
-            self.ws.search_open = true;
-            self.ws.search_focus = true;
-        }
-        if open_gfind && self.ws.project_root.is_some() {
-            self.ws.gsearch_open = true;
-            self.ws.gsearch_focus = true;
-            self.gsearch_warm(ctx);
+        // Keymap shortcuts are suspended while the settings window captures keys.
+        if !self.settings_open {
+            self.handle_shortcuts(ctx);
         }
         if esc {
             self.ws.search_open = false;
             self.ws.gsearch_open = false;
+            self.ws.finder_open = false;
         }
-        if back {
+        if mouse_back || alt_back {
             self.nav_back();
         }
-        if forward {
+        if mouse_fwd || alt_fwd {
             self.nav_forward();
         }
 
@@ -1161,6 +2406,7 @@ impl eframe::App for CodeLookApp {
         // fires ~120ms after typing stops, so results update live without Enter.
         // (Skipped in capture mode, where results are populated synchronously.)
         self.gsearch_poll();
+        self.git_op_poll(ctx);
         let now = ctx.input(|i| i.time);
         if self.shot.is_some() {
             self.ws.gsearch_prev = self.ws.gsearch_query.clone();
@@ -1178,12 +2424,15 @@ impl eframe::App for CodeLookApp {
         }
 
         self.top_bar(ctx);
+        self.branch_menu(ctx); // before bottom_bar so click-away logic is stable
         self.bottom_bar(ctx);
         self.git_log_panel(ctx);
         self.side_tree(ctx);
         self.structure_panel(ctx);
         self.central(ctx);
         self.global_search_window(ctx);
+        self.finder_window(ctx);
+        self.settings_window(ctx);
     }
 }
 
@@ -1245,11 +2494,19 @@ impl CodeLookApp {
                             self.open_project(ctx, dir);
                         }
                     }
-                    if ui.button("검색").on_hover_text("⌘F").clicked() && self.ws.active.is_some() {
+                    if ui
+                        .button("검색")
+                        .on_hover_text(self.keymap.text(crate::keymap::Action::FindInFile))
+                        .clicked()
+                        && self.ws.active.is_some()
+                    {
                         self.ws.search_open = true;
                         self.ws.search_focus = true;
                     }
-                    if ui.button("전체 검색").on_hover_text("⇧⌘F").clicked()
+                    if ui
+                        .button("전체 검색")
+                        .on_hover_text(self.keymap.text(crate::keymap::Action::FindInProject))
+                        .clicked()
                         && self.ws.project_root.is_some()
                     {
                         self.ws.gsearch_open = true;
@@ -1273,8 +2530,7 @@ impl CodeLookApp {
 
                     ui.add_space(4.0);
                     if ui.small_button("A−").on_hover_text("글자 작게").clicked() {
-                        self.font_size = (self.font_size - 1.0).max(8.0);
-                        self.rehighlight_open_tabs();
+                        self.zoom(-1.0);
                     }
                     ui.label(
                         egui::RichText::new(format!("{}px", self.font_size as i32))
@@ -1282,8 +2538,12 @@ impl CodeLookApp {
                             .size(12.0),
                     );
                     if ui.small_button("A+").on_hover_text("글자 크게").clicked() {
-                        self.font_size = (self.font_size + 1.0).min(40.0);
-                        self.rehighlight_open_tabs();
+                        self.zoom(1.0);
+                    }
+                    ui.add_space(4.0);
+                    sep_dot(ui);
+                    if ui.small_button("설정").on_hover_text("단축키 설정").clicked() {
+                        self.settings_open = true;
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -1309,41 +2569,209 @@ impl CodeLookApp {
         }
         egui::SidePanel::left("tree_panel")
             .resizable(true)
-            .default_width(260.0)
-            .width_range(170.0..=600.0)
+            .default_width(296.0)
+            .width_range(206.0..=640.0)
             .frame(egui::Frame::default().fill(C_PANEL).inner_margin(0.0))
             .show(ctx, |ui| {
-                tool_window_header(ui, "PROJECT", None);
-                egui::ScrollArea::both()
-                    .id_salt(("tree_scroll", self.ws.seq))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        let active_path = self
-                            .ws
-                            .active
-                            .and_then(|i| self.ws.tabs.get(i))
-                            .map(|t| t.path.clone());
-                        let mut to_open = None;
-                        let status = &self.ws.git_status;
-                        let icons = &self.icons;
-                        if let Some(root) = &mut self.ws.tree {
-                            show_node(ui, root, 0, active_path.as_deref(), status, icons, &mut to_open);
-                        } else {
-                            ui.add_space(20.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    egui::RichText::new("열린 프로젝트가 없습니다")
-                                        .color(C_TEXT_DIM),
-                                );
-                            });
-                        }
-                        if let Some(p) = to_open {
-                            self.open_file(p.clone());
-                            self.record_nav(p, 0);
-                        }
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    self.tool_strip(ui);
+                    ui.vertical(|ui| match self.left_view {
+                        LeftView::Project => self.project_tree_view(ui),
+                        LeftView::Commit => self.commit_sidebar(ui),
                     });
+                });
             });
+    }
+
+    /// The file tree (left panel, Project view).
+    fn project_tree_view(&mut self, ui: &mut egui::Ui) {
+        self.left_header(ui, "PROJECT", true);
+        let mut reveal = self.ws.reveal_path.take();
+        egui::ScrollArea::both()
+            .id_salt(("tree_scroll", self.ws.seq))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let active_path = self
+                    .ws
+                    .active
+                    .and_then(|i| self.ws.tabs.get(i))
+                    .map(|t| t.path.clone());
+                let mut to_open = None;
+                let status = &self.ws.git_status;
+                let icons = &self.icons;
+                if let Some(root) = &mut self.ws.tree {
+                    show_node(
+                        ui,
+                        root,
+                        0,
+                        active_path.as_deref(),
+                        status,
+                        icons,
+                        &mut to_open,
+                        &mut reveal,
+                    );
+                } else {
+                    ui.add_space(20.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("열린 프로젝트가 없습니다").color(C_TEXT_DIM),
+                        );
+                    });
+                }
+                if let Some(p) = to_open {
+                    self.record_origin();
+                    self.open_file(p.clone());
+                    self.record_nav(p, 0);
+                }
+            });
+    }
+
+    /// Vertical tool-window strip on the far left (IntelliJ New UI): switch
+    /// the left panel between the project tree and the commit (changes) view.
+    fn tool_strip(&mut self, ui: &mut egui::Ui) {
+        let h = ui.available_height();
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(36.0, h), Sense::hover());
+        let p = ui.painter();
+        p.vline(
+            rect.right() - 0.5,
+            rect.y_range(),
+            Stroke::new(1.0, C_BORDER),
+        );
+        let n_changes = self.ws.git_status.len();
+        for (i, (view, tip)) in [
+            (LeftView::Project, "프로젝트".to_string()),
+            (LeftView::Commit, format!("변경사항 (커밋 전) — {n_changes}개 파일")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r = Rect::from_min_size(
+                egui::pos2(rect.left() + 5.0, rect.top() + 8.0 + i as f32 * 36.0),
+                Vec2::splat(26.0),
+            );
+            let resp = ui.interact(r, ui.id().with(("tool_strip", i)), Sense::click());
+            let active = self.left_view == view;
+            if active {
+                p.rect_filled(r, 6.0, C_HOVER);
+            } else if resp.hovered() {
+                p.rect_filled(r, 6.0, C_HOVER.gamma_multiply(0.5));
+            }
+            match view {
+                LeftView::Project => {
+                    self.icons.folder(p, r.shrink(4.0), "", false);
+                }
+                LeftView::Commit => {
+                    draw_branch_icon(
+                        p,
+                        r.center(),
+                        if active { C_TEXT } else { C_TEXT_DIM },
+                    );
+                    // Green dot = uncommitted changes exist.
+                    if n_changes > 0 {
+                        p.circle_filled(
+                            egui::pos2(r.right() - 3.0, r.top() + 3.0),
+                            3.0,
+                            Color32::from_rgb(0x62, 0xb5, 0x43),
+                        );
+                    }
+                }
+            }
+            if resp.on_hover_text(tip).clicked() {
+                self.left_view = view;
+            }
+        }
+    }
+
+    /// Left-panel Commit view: uncommitted working-tree changes at a glance;
+    /// clicking a file opens its HEAD-vs-worktree diff for review.
+    fn commit_sidebar(&mut self, ui: &mut egui::Ui) {
+        self.left_header(ui, "COMMIT", false);
+        let files = self.local_changes();
+        let mut open: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .id_salt(("commit_sidebar", self.ws.seq))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.add_space(2.0);
+                let (hr, _) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), 22.0),
+                    Sense::hover(),
+                );
+                ui.painter().text(
+                    egui::pos2(hr.left() + 10.0, hr.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("변경사항 {}개 파일", files.len()),
+                    FontId::proportional(12.0),
+                    C_TEXT_DIM,
+                );
+                if files.is_empty() {
+                    ui.add_space(16.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("커밋 전 변경사항 없음").color(C_TEXT_DIM),
+                        );
+                    });
+                }
+                for (path, status) in &files {
+                    let (rr, resp) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 22.0),
+                        Sense::click(),
+                    );
+                    let p = ui.painter();
+                    let is_open = self
+                        .ws
+                        .diff_view
+                        .as_ref()
+                        .map(|d| &d.file == path)
+                        .unwrap_or(false);
+                    if is_open {
+                        p.rect_filled(rr, 0.0, C_SEL);
+                    } else if resp.hovered() {
+                        p.rect_filled(rr, 0.0, C_HOVER);
+                    }
+                    p.text(
+                        egui::pos2(rr.left() + 10.0, rr.center().y),
+                        Align2::LEFT_CENTER,
+                        status_letter(*status),
+                        FontId::monospace(12.0),
+                        status_color(*status),
+                    );
+                    p.text(
+                        egui::pos2(rr.left() + 26.0, rr.center().y),
+                        Align2::LEFT_CENTER,
+                        path,
+                        FontId::proportional(12.5),
+                        if is_open { Color32::WHITE } else { C_TEXT },
+                    );
+                    if resp.on_hover_text(path).clicked() {
+                        open = Some(path.clone());
+                    }
+                }
+            });
+        if let Some(f) = open {
+            self.open_working_diff(f);
+        }
+    }
+
+    /// Uncommitted changes as sorted (relative path, status) pairs.
+    fn local_changes(&self) -> Vec<(String, crate::git::FileStatus)> {
+        let root = self.ws.project_root.clone().unwrap_or_default();
+        let mut files: Vec<(String, crate::git::FileStatus)> = self
+            .ws
+            .git_status
+            .iter()
+            .map(|(p, s)| {
+                (
+                    p.strip_prefix(&root).unwrap_or(p).to_string_lossy().to_string(),
+                    *s,
+                )
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
     }
 
     /// IntelliJ-style "Structure" view: AST-derived document symbols of the
@@ -1386,8 +2814,8 @@ impl CodeLookApp {
                             }
                         });
                     if let Some(line) = jump {
-                        self.ws.tabs[i].scroll_to_line = Some(line);
-                        self.ws.tabs[i].flash_line = Some(line);
+                        self.record_origin();
+                        self.set_jump_target(line);
                         let p = self.ws.tabs[i].path.clone();
                         self.record_nav(p, line);
                     }
@@ -1460,21 +2888,15 @@ impl CodeLookApp {
                     }
                 }
 
-                // Right side: [line count · lang]  ·  ⑂ branch.
+                // Right side: [git-op] · line count · lang. (The branch
+                // control lives in the PROJECT header.)
                 let mut right = String::new();
+                if let Some((label, _)) = &self.ws.git_op {
+                    right = format!("git {label} 실행 중…   ·   ");
+                }
                 if let Some(tab) = self.ws.active.and_then(|i| self.ws.tabs.get(i)) {
                     let lang = tab.lang.map(|l| l.label()).unwrap_or("Text");
-                    right = format!("{} lines   ·   {}", tab.line_count, lang);
-                }
-                if let Some(branch) = &self.ws.git_branch {
-                    if !right.is_empty() {
-                        right.push_str("   ·   ");
-                    }
-                    right.push_str(branch);
-                    // small branch icon before the whole right cluster
-                    let g = p.layout_no_wrap(right.clone(), font.clone(), C_TEXT_DIM);
-                    let bx = rect.right() - g.size().x - 16.0;
-                    draw_branch_icon(p, egui::pos2(bx + 5.0, cy), C_TEXT_DIM);
+                    right.push_str(&format!("{} lines   ·   {}", tab.line_count, lang));
                 }
                 p.text(
                     egui::pos2(rect.right(), cy),
@@ -1559,9 +2981,14 @@ impl CodeLookApp {
 
         egui::Window::new("전체 검색")
             .collapsible(false)
-            .resizable(false)
-            .fixed_size([1000.0, 600.0])
-            .anchor(Align2::CENTER_TOP, [0.0, 60.0])
+            .resizable(true)
+            .default_size([1000.0, 600.0])
+            .min_width(560.0)
+            .min_height(340.0)
+            .default_pos(egui::pos2(
+                ctx.screen_rect().center().x - 500.0,
+                ctx.screen_rect().top() + 60.0,
+            ))
             .frame(
                 egui::Frame::window(&ctx.style())
                     .fill(C_PANEL)
@@ -1586,7 +3013,7 @@ impl CodeLookApp {
                 ui.separator();
 
                 let body_h = ui.available_height();
-                let list_h = (body_h * 0.42).clamp(110.0, 300.0);
+                let list_h = (body_h * 0.42).max(110.0);
 
                 // ---- Results list (top) ----
                 egui::ScrollArea::vertical()
@@ -1842,8 +3269,12 @@ impl CodeLookApp {
         }
         let loading = self.ws.commits_rx.is_some();
         let mut sel_commit: Option<usize> = None;
+        let mut sel_local = false;
         let mut open_file: Option<String> = None;
+        let mut open_wfile: Option<String> = None;
         let mut close = false;
+        // Working-tree changes (uncommitted), as relative paths.
+        let local_files = self.local_changes();
 
         egui::TopBottomPanel::bottom("git_log")
             .resizable(true)
@@ -1904,18 +3335,70 @@ impl CodeLookApp {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
+
+                                // Pinned row: uncommitted working-tree changes
+                                // (커밋 전 검토) — IntelliJ's Local Changes.
+                                {
+                                    let (rr, resp) = ui.allocate_exact_size(
+                                        Vec2::new(ui.available_width(), 24.0),
+                                        Sense::click(),
+                                    );
+                                    let p = ui.painter();
+                                    if self.ws.local_sel {
+                                        p.rect_filled(rr, 0.0, C_SEL);
+                                    } else if resp.hovered() {
+                                        p.rect_filled(rr, 0.0, C_HOVER);
+                                    }
+                                    let dot = if local_files.is_empty() {
+                                        C_TEXT_DIM
+                                    } else {
+                                        Color32::from_rgb(0x62, 0xb5, 0x43)
+                                    };
+                                    p.circle_filled(
+                                        egui::pos2(rr.left() + 14.0, rr.center().y),
+                                        3.5,
+                                        dot,
+                                    );
+                                    p.text(
+                                        egui::pos2(rr.left() + 26.0, rr.center().y),
+                                        Align2::LEFT_CENTER,
+                                        "변경사항 (커밋 전)",
+                                        FontId::proportional(13.0),
+                                        if self.ws.local_sel {
+                                            Color32::WHITE
+                                        } else {
+                                            C_TEXT
+                                        },
+                                    );
+                                    p.text(
+                                        egui::pos2(rr.right() - 8.0, rr.center().y),
+                                        Align2::RIGHT_CENTER,
+                                        format!("{}개 파일", local_files.len()),
+                                        FontId::proportional(11.5),
+                                        C_TEXT_DIM,
+                                    );
+                                    if resp.clicked() {
+                                        sel_local = true;
+                                    }
+                                    ui.painter().hline(
+                                        rr.x_range(),
+                                        rr.bottom(),
+                                        Stroke::new(1.0, C_BORDER.gamma_multiply(0.7)),
+                                    );
+                                }
+
                                 for (i, c) in self.ws.commits.iter().enumerate() {
                                     let (rr, resp) = ui.allocate_exact_size(
                                         Vec2::new(ui.available_width(), 24.0),
                                         Sense::click(),
                                     );
                                     let p = ui.painter();
-                                    if i == self.ws.commit_sel {
+                                    let sel = !self.ws.local_sel && i == self.ws.commit_sel;
+                                    if sel {
                                         p.rect_filled(rr, 0.0, C_SEL);
                                     } else if resp.hovered() {
                                         p.rect_filled(rr, 0.0, C_HOVER);
                                     }
-                                    let sel = i == self.ws.commit_sel;
                                     p.text(
                                         egui::pos2(rr.left() + 10.0, rr.center().y),
                                         Align2::LEFT_CENTER,
@@ -1971,7 +3454,32 @@ impl CodeLookApp {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
-                                for f in &self.ws.commit_files {
+                                // (path, status) rows: working-tree changes when
+                                // the pinned row is selected, else the commit's.
+                                let rows: Vec<(String, crate::git::FileStatus)> =
+                                    if self.ws.local_sel {
+                                        local_files.clone()
+                                    } else {
+                                        self.ws
+                                            .commit_files
+                                            .iter()
+                                            .map(|f| (f.path.clone(), f.status))
+                                            .collect()
+                                    };
+                                if rows.is_empty() {
+                                    ui.add_space(14.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(if self.ws.local_sel {
+                                                "커밋 전 변경사항 없음"
+                                            } else {
+                                                "변경 파일 없음"
+                                            })
+                                            .color(C_TEXT_DIM),
+                                        );
+                                    });
+                                }
+                                for (path, status) in &rows {
                                     let (rr, resp) = ui.allocate_exact_size(
                                         Vec2::new(ui.available_width(), 22.0),
                                         Sense::click(),
@@ -1981,36 +3489,33 @@ impl CodeLookApp {
                                         .ws
                                         .diff_view
                                         .as_ref()
-                                        .map(|d| d.file == f.path)
+                                        .map(|d| &d.file == path)
                                         .unwrap_or(false);
                                     if is_open {
                                         p.rect_filled(rr, 0.0, C_SEL);
                                     } else if resp.hovered() {
                                         p.rect_filled(rr, 0.0, C_HOVER);
                                     }
-                                    // status letter
-                                    let (letter, lc) = match f.status {
-                                        crate::git::FileStatus::Added => ("A", status_color(f.status)),
-                                        crate::git::FileStatus::Deleted => ("D", status_color(f.status)),
-                                        crate::git::FileStatus::Renamed => ("R", status_color(f.status)),
-                                        _ => ("M", status_color(f.status)),
-                                    };
                                     p.text(
                                         egui::pos2(rr.left() + 10.0, rr.center().y),
                                         Align2::LEFT_CENTER,
-                                        letter,
+                                        status_letter(*status),
                                         FontId::monospace(12.0),
-                                        lc,
+                                        status_color(*status),
                                     );
                                     p.text(
                                         egui::pos2(rr.left() + 26.0, rr.center().y),
                                         Align2::LEFT_CENTER,
-                                        &f.path,
+                                        path,
                                         FontId::proportional(12.5),
                                         if is_open { Color32::WHITE } else { C_TEXT },
                                     );
                                     if resp.clicked() {
-                                        open_file = Some(f.path.clone());
+                                        if self.ws.local_sel {
+                                            open_wfile = Some(path.clone());
+                                        } else {
+                                            open_file = Some(path.clone());
+                                        }
                                     }
                                 }
                             });
@@ -2021,11 +3526,18 @@ impl CodeLookApp {
         if close {
             self.ws.log_open = false;
         }
+        if sel_local {
+            self.ws.local_sel = true;
+            self.refresh_git_status(ctx);
+        }
         if let Some(i) = sel_commit {
             self.select_commit(i);
         }
         if let Some(f) = open_file {
             self.open_commit_diff(f);
+        }
+        if let Some(f) = open_wfile {
+            self.open_working_diff(f);
         }
     }
 
@@ -2057,7 +3569,11 @@ impl CodeLookApp {
             return;
         };
         if diff.jobs_font != self.font_size {
-            diff.jobs = build_diff_jobs(&self.highlighter, &diff.file, &diff.lines, self.font_size);
+            let (text, job) =
+                build_diff_doc(&self.highlighter, &diff.file, &diff.lines, self.font_size);
+            diff.edit_buf = text.clone();
+            diff.text = text;
+            diff.job = job;
             diff.jobs_font = self.font_size;
         }
         let mut keep = true;
@@ -2087,84 +3603,109 @@ impl CodeLookApp {
 
         let font = FontId::monospace(self.font_size);
         let lh = crate::highlight::line_height(self.font_size);
+        let n = diff.lines.len().max(1);
+        let gutter_w = 104.0;
         egui::ScrollArea::both()
             .id_salt(("diff_scroll", self.ws.seq))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                let full_w = ui.available_width();
-                for (li, dl) in diff.lines.iter().enumerate() {
-                    let (rr, _) = ui.allocate_exact_size(Vec2::new(full_w.max(600.0), lh), Sense::hover());
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.horizontal_top(|ui| {
+                    // Gutter: old/new line numbers + the +/- mark per row.
+                    let (g_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(gutter_w, n as f32 * lh + 4.0),
+                        Sense::hover(),
+                    );
                     let p = ui.painter();
-                    let (bg_col, mark, mark_col, txt_col) = match dl.kind {
-                        crate::git::DiffKind::Add => (
-                            Color32::from_rgb(0x28, 0x3a, 0x28),
-                            "+",
-                            Color32::from_rgb(0x7e, 0xc6, 0x99),
-                            C_TEXT,
-                        ),
-                        crate::git::DiffKind::Del => (
-                            Color32::from_rgb(0x3f, 0x2b, 0x2b),
-                            "-",
-                            Color32::from_rgb(0xe0, 0x6c, 0x75),
-                            C_TEXT,
-                        ),
-                        crate::git::DiffKind::Hunk => (
-                            Color32::from_rgb(0x2b, 0x2d, 0x30),
-                            "",
-                            C_TEXT_DIM,
-                            Color32::from_rgb(0x56, 0xb6, 0xc2),
-                        ),
-                        crate::git::DiffKind::Context => {
-                            (C_EDITOR, "", C_TEXT_DIM, C_TEXT_DIM)
+                    let clip = ui.clip_rect();
+                    // Rows start 2px down: the TextEdit's inner top margin.
+                    let top = g_rect.top() + 2.0;
+
+                    // 1) Add/Del/Hunk row backgrounds first (full width, under
+                    // both the gutter text and the code).
+                    let galley_w = ui.fonts(|f| f.layout_job(diff.job.clone())).size().x;
+                    let band_right = clip.right().max(g_rect.right() + galley_w + 24.0);
+                    for (li, dl) in diff.lines.iter().enumerate() {
+                        let bg = match dl.kind {
+                            crate::git::DiffKind::Add => Color32::from_rgb(0x28, 0x3a, 0x28),
+                            crate::git::DiffKind::Del => Color32::from_rgb(0x3f, 0x2b, 0x2b),
+                            crate::git::DiffKind::Hunk => Color32::from_rgb(0x2b, 0x2d, 0x30),
+                            crate::git::DiffKind::Context => continue,
+                        };
+                        let y = top + li as f32 * lh;
+                        if y + lh < clip.top() || y > clip.bottom() {
+                            continue;
                         }
-                    };
-                    if bg_col != C_EDITOR {
-                        p.rect_filled(rr, 0.0, bg_col);
+                        p.rect_filled(
+                            Rect::from_min_max(
+                                egui::pos2(g_rect.left() - 8.0, y),
+                                egui::pos2(band_right, y + lh),
+                            ),
+                            0.0,
+                            bg,
+                        );
                     }
-                    // old / new line-number gutter
-                    let onum = dl.old_no.map(|n| n.to_string()).unwrap_or_default();
-                    let nnum = dl.new_no.map(|n| n.to_string()).unwrap_or_default();
-                    p.text(
-                        egui::pos2(rr.left() + 44.0, rr.center().y),
-                        Align2::RIGHT_CENTER,
-                        onum,
-                        FontId::monospace(11.5),
-                        C_TEXT_DIM,
-                    );
-                    p.text(
-                        egui::pos2(rr.left() + 90.0, rr.center().y),
-                        Align2::RIGHT_CENTER,
-                        nnum,
-                        FontId::monospace(11.5),
-                        C_TEXT_DIM,
-                    );
-                    p.text(
-                        egui::pos2(rr.left() + 100.0, rr.center().y),
-                        Align2::LEFT_CENTER,
-                        mark,
-                        font.clone(),
-                        mark_col,
-                    );
-                    // Syntax-highlighted line when available (code rows);
-                    // hunk headers keep the plain colored text.
-                    match diff.jobs.get(li).and_then(|j| j.as_ref()) {
-                        Some(job) if !job.text.is_empty() => {
-                            let galley = ui.fonts(|f| f.layout_job(job.clone()));
-                            let y = rr.center().y - galley.size().y / 2.0;
-                            p.galley(egui::pos2(rr.left() + 112.0, y), galley, C_TEXT);
+
+                    // 2) Gutter: old/new line numbers + the +/- mark per row.
+                    for (li, dl) in diff.lines.iter().enumerate() {
+                        let y = top + li as f32 * lh;
+                        if y + lh < clip.top() || y > clip.bottom() {
+                            continue;
                         }
-                        _ => {
+                        let cy = y + lh / 2.0;
+                        let (mark, mark_col) = match dl.kind {
+                            crate::git::DiffKind::Add => {
+                                ("+", Color32::from_rgb(0x7e, 0xc6, 0x99))
+                            }
+                            crate::git::DiffKind::Del => {
+                                ("-", Color32::from_rgb(0xe0, 0x6c, 0x75))
+                            }
+                            _ => ("", C_TEXT_DIM),
+                        };
+                        if let Some(o) = dl.old_no {
                             p.text(
-                                egui::pos2(rr.left() + 112.0, rr.center().y),
+                                egui::pos2(g_rect.left() + 40.0, cy),
+                                Align2::RIGHT_CENTER,
+                                o.to_string(),
+                                FontId::monospace(11.5),
+                                C_TEXT_DIM,
+                            );
+                        }
+                        if let Some(nn) = dl.new_no {
+                            p.text(
+                                egui::pos2(g_rect.left() + 84.0, cy),
+                                Align2::RIGHT_CENTER,
+                                nn.to_string(),
+                                FontId::monospace(11.5),
+                                C_TEXT_DIM,
+                            );
+                        }
+                        if !mark.is_empty() {
+                            p.text(
+                                egui::pos2(g_rect.left() + 92.0, cy),
                                 Align2::LEFT_CENTER,
-                                &dl.text,
+                                mark,
                                 font.clone(),
-                                txt_col,
+                                mark_col,
                             );
                         }
                     }
-                }
+
+                    // The diff body: read-only TextEdit → drag-select + ⌘C.
+                    let job_for_layouter = diff.job.clone();
+                    let mut layouter = move |ui: &egui::Ui, _buf: &str, _w: f32| {
+                        ui.fonts(|f| f.layout_job(job_for_layouter.clone()))
+                    };
+                    let out = egui::TextEdit::multiline(&mut diff.edit_buf)
+                        .font(font.clone())
+                        .frame(false)
+                        .desired_width(galley_w.max(ui.available_width()))
+                        .layouter(&mut layouter)
+                        .show(ui);
+                    if out.response.changed() {
+                        diff.edit_buf = diff.text.clone();
+                    }
+                });
             });
 
         if keep {
@@ -2353,9 +3894,11 @@ impl CodeLookApp {
         }
 
         if let Some(i) = select {
+            self.record_origin();
             self.ws.active = Some(i);
             self.refresh_search();
-            let (p, line) = (self.ws.tabs[i].path.clone(), self.ws.tabs[i].flash_line.unwrap_or(0));
+            let t = &self.ws.tabs[i];
+            let (p, line) = (t.path.clone(), t.caret_line.or(t.flash_line).unwrap_or(0));
             self.record_nav(p, line);
         }
         if let Some(i) = close {
@@ -2424,6 +3967,7 @@ impl CodeLookApp {
         let mut goto: Option<String> = None;
         let mut clear_scroll = false;
         let mut clicked_nothing = false;
+        let mut caret_clicked: Option<usize> = None;
 
         // Borrow the single tab so edit_buf / content can be touched independently.
         let tab = &mut self.ws.tabs[idx];
@@ -2512,10 +4056,30 @@ impl CodeLookApp {
                         .right()
                         .max(out.galley_pos.x + out.galley.size().x + 16.0);
 
-                    // Active (caret) line band — gives the editor a live feel.
-                    // Painted over the text, so keep it translucent (text shows through).
+                    // Track the caret. The TextEdit keeps a (possibly stale)
+                    // caret across tab switches and jumps, so only a real
+                    // caret move (click / drag / arrow keys) may update our
+                    // tracked position.
                     if let Some(cur) = out.cursor_range {
                         let row = cur.primary.rcursor.row;
+                        let ci = cur.primary.ccursor.index;
+                        if tab.last_cursor_ci != Some(ci) || out.response.clicked() {
+                            tab.last_cursor_ci = Some(ci);
+                            tab.caret_ci = Some(ci);
+                            tab.caret_line = Some(row);
+                            if out.response.clicked() {
+                                caret_clicked = Some(row);
+                                // A click supersedes the jump highlight — one
+                                // band on screen, where the user clicked.
+                                tab.flash_line = None;
+                            }
+                        }
+                    }
+
+                    // Active (caret) line band, from the TRACKED caret — a
+                    // freshly opened file shows no band until the user clicks
+                    // or jumps. Translucent so text shows through.
+                    if let Some(row) = tab.caret_line {
                         let y = out.galley_pos.y + row_h * row as f32;
                         ui.painter().rect_filled(
                             Rect::from_min_max(
@@ -2577,6 +4141,15 @@ impl CodeLookApp {
                     }
                 });
             });
+
+        // Every plain click is a navigation point (IntelliJ-style): Back walks
+        // through previous click positions, not only through jumps. Clicks on
+        // nearby lines refine the current entry instead of flooding history.
+        if let Some(line) = caret_clicked {
+            if !ctx.input(|i| i.modifiers.command || i.modifiers.ctrl) {
+                self.note_click_nav(line);
+            }
+        }
 
         if clear_scroll {
             self.ws.tabs[idx].scroll_to_line = None;
@@ -2675,6 +4248,34 @@ fn save_png(path: &Path, image: &egui::ColorImage) {
 
 #[cfg(not(feature = "shot"))]
 fn save_png(_path: &Path, _image: &egui::ColorImage) {}
+
+/// Record every expanded directory (used to rebuild the tree after git ops
+/// without collapsing what the user had open).
+fn collect_expanded(node: &TreeNode, out: &mut std::collections::HashSet<PathBuf>) {
+    if node.is_dir && node.expanded {
+        out.insert(node.path.clone());
+        if let Some(children) = &node.children {
+            for c in children {
+                collect_expanded(c, out);
+            }
+        }
+    }
+}
+
+/// Re-expand directories from a recorded set, loading children as needed.
+fn apply_expanded(node: &mut TreeNode, set: &std::collections::HashSet<PathBuf>) {
+    if node.is_dir && set.contains(&node.path) {
+        node.expanded = true;
+        if node.children.is_none() {
+            node.children = Some(load_children(&node.path));
+        }
+        if let Some(children) = &mut node.children {
+            for c in children {
+                apply_expanded(c, set);
+            }
+        }
+    }
+}
 
 fn load_children(dir: &Path) -> Vec<TreeNode> {
     let mut nodes = Vec::new();
@@ -2985,6 +4586,7 @@ fn status_color(s: crate::git::FileStatus) -> Color32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_node(
     ui: &mut egui::Ui,
     node: &mut TreeNode,
@@ -2993,11 +4595,17 @@ fn show_node(
     status: &HashMap<PathBuf, crate::git::FileStatus>,
     icons: &icons::IconSet,
     to_open: &mut Option<PathBuf>,
+    reveal: &mut Option<PathBuf>,
 ) {
     let selected = !node.is_dir && active == Some(node.path.as_path());
 
     let full_w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(full_w, TREE_ROW_H), Sense::click());
+    // "Select Opened File": scroll this row into view (one-shot).
+    if reveal.as_deref() == Some(node.path.as_path()) {
+        ui.scroll_to_rect(rect, Some(Align::Center));
+        *reveal = None;
+    }
     let painter = ui.painter();
 
     // Row background: full-width selection / hover.
@@ -3071,7 +4679,7 @@ fn show_node(
     if node.is_dir && node.expanded {
         if let Some(children) = &mut node.children {
             for child in children.iter_mut() {
-                show_node(ui, child, depth + 1, active, status, icons, to_open);
+                show_node(ui, child, depth + 1, active, status, icons, to_open, reveal);
             }
         }
     }
