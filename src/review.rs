@@ -27,7 +27,21 @@ pub struct ReviewFile {
     pub deleted: usize,
     /// Base…head line changes mapped onto the head file (editor overlay).
     pub overlay: FileDiff,
+    /// Pure-deletion hunks: (head-line insertion anchor = number of head
+    /// lines above the gap, deleted lines). Rendered as inline ghost rows.
+    pub deleted_text: Vec<(usize, Vec<String>)>,
     pub viewed: bool,
+}
+
+/// A line comment queued locally; submitted together with the review.
+#[derive(Clone)]
+pub struct PendingComment {
+    pub path: String,
+    /// 1-based line in the PR head file (what GitHub's API expects).
+    pub line: usize,
+    /// 0-based display line in the ghost-merged editor doc (for markers).
+    pub disp_line: usize,
+    pub body: String,
 }
 
 pub struct ReviewSession {
@@ -39,6 +53,8 @@ pub struct ReviewSession {
     /// the review content (⌘+Click and search all line up).
     pub head_is_workdir: bool,
     pub files: Vec<ReviewFile>,
+    /// Line comments queued for submission.
+    pub pending: Vec<PendingComment>,
 }
 
 impl ReviewSession {
@@ -159,6 +175,9 @@ pub fn build_session(
         .map_err(|e| e.to_string())?;
 
     let files = std::cell::RefCell::new(Vec::<ReviewFile>::new());
+    // Whether the current hunk is a pure deletion (its '-' lines become
+    // inline ghost rows rather than replaced-by-new-code lines).
+    let pure_del = std::cell::Cell::new(false);
     diff.foreach(
         &mut |delta, _| {
             let path = delta
@@ -174,6 +193,7 @@ pub fn build_session(
                     added: 0,
                     deleted: 0,
                     overlay: FileDiff::default(),
+                    deleted_text: Vec::new(),
                     viewed: false,
                 });
             }
@@ -190,7 +210,10 @@ pub fn build_session(
             let ol = hunk.old_lines() as usize;
             if nl == 0 {
                 f.overlay.deleted_before.push(ns.saturating_sub(1));
+                f.deleted_text.push((ns, Vec::new()));
+                pure_del.set(true);
             } else {
+                pure_del.set(false);
                 let kind = if ol == 0 {
                     LineChange::Added
                 } else {
@@ -207,7 +230,18 @@ pub fn build_session(
             let Some(f) = fs.last_mut() else { return true };
             match line.origin() {
                 '+' => f.added += 1,
-                '-' => f.deleted += 1,
+                '-' => {
+                    f.deleted += 1;
+                    if pure_del.get() {
+                        if let Some((_, texts)) = f.deleted_text.last_mut() {
+                            texts.push(
+                                String::from_utf8_lossy(line.content())
+                                    .trim_end_matches('\n')
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
                 _ => {}
             }
             true
@@ -225,7 +259,105 @@ pub fn build_session(
         head_id: head_oid.to_string(),
         head_is_workdir,
         files,
+        pending: Vec::new(),
     })
+}
+
+fn json_str(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+fn gh_api_review(root: &Path, number: u64, payload: &str) -> Result<(), String> {
+    let file = std::env::temp_dir().join(format!("codelook_review_{}.json", std::process::id()));
+    std::fs::write(&file, payload).map_err(|e| e.to_string())?;
+    let out = Command::new("gh")
+        .current_dir(root)
+        .args([
+            "api",
+            &format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews"),
+            "--input",
+        ])
+        .arg(&file)
+        .output()
+        .map_err(|e| format!("gh 실행 실패: {e}"))?;
+    std::fs::remove_file(&file).ok();
+    if out.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Err(if err.is_empty() { body } else { err })
+    }
+}
+
+/// Submit the review to GitHub via `gh`: event is "APPROVE" / "COMMENT" /
+/// "REQUEST_CHANGES", with the queued line comments attached. GitHub only
+/// accepts line comments inside the diff, so on rejection the comments are
+/// folded into the review body (`path:line — text`) and submitted again.
+pub fn submit_review(
+    root: &Path,
+    number: u64,
+    head_id: &str,
+    event: &str,
+    body: &str,
+    comments: &[PendingComment],
+) -> Result<String, String> {
+    let base = format!(
+        "\"commit_id\":{},\"event\":{},\"body\":",
+        json_str(head_id),
+        json_str(event)
+    );
+    if !comments.is_empty() {
+        let list = comments
+            .iter()
+            .map(|c| {
+                format!(
+                    "{{\"path\":{},\"line\":{},\"side\":\"RIGHT\",\"body\":{}}}",
+                    json_str(&c.path),
+                    c.line,
+                    json_str(&c.body)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let payload = format!("{{{base}{},\"comments\":[{list}]}}", json_str(body));
+        match gh_api_review(root, number, &payload) {
+            Ok(()) => {
+                return Ok(format!("{event} · 라인 코멘트 {}개", comments.len()));
+            }
+            Err(e) => {
+                // Comments outside the diff → fold into the body and retry.
+                let mut folded = body.to_string();
+                for c in comments {
+                    folded.push_str(&format!("\n\n**{}:{}**\n{}", c.path, c.line, c.body));
+                }
+                let payload = format!("{{{base}{}}}", json_str(folded.trim()));
+                gh_api_review(root, number, &payload)
+                    .map_err(|e2| format!("{e} / 본문 폴백도 실패: {e2}"))?;
+                return Ok(format!(
+                    "{event} · 코멘트 {}개는 본문에 병합됨(diff 밖 라인)",
+                    comments.len()
+                ));
+            }
+        }
+    }
+    let payload = format!("{{{base}{}}}", json_str(body));
+    gh_api_review(root, number, &payload)?;
+    Ok(event.to_string())
 }
 
 /// One row of the open-PR picker.
@@ -348,6 +480,44 @@ pub fn ensure_worktree(root: &Path, number: u64) -> Result<std::path::PathBuf, S
     Ok(dir)
 }
 
+/// True when `dir` is a CodeLook-managed review worktree (the only kind we
+/// ever delete automatically).
+pub fn is_managed_worktree(dir: &Path) -> bool {
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let base = std::path::PathBuf::from(home).join(".codelook").join("worktrees");
+    dir.starts_with(&base) && dir != base
+}
+
+/// Remove a managed review worktree (checkout copy only — the repo's
+/// objects/branches are untouched). Refuses anything outside
+/// `~/.codelook/worktrees`.
+pub fn remove_worktree(dir: &Path) -> Result<(), String> {
+    if !is_managed_worktree(dir) {
+        return Err("관리 대상 워크트리가 아닙니다".to_string());
+    }
+    let main = crate::git::main_worktree_root(dir).ok_or("원본 레포를 찾을 수 없음")?;
+    let dir_s = dir.to_string_lossy().to_string();
+    let (ok, _) = crate::git::run_git(
+        &main,
+        &["worktree".into(), "remove".into(), dir_s.clone()],
+    );
+    if ok {
+        return Ok(());
+    }
+    // The review copy is disposable by definition — force past stray files.
+    let (ok, msg) = crate::git::run_git(
+        &main,
+        &["worktree".into(), "remove".into(), "--force".into(), dir_s],
+    );
+    if ok {
+        Ok(())
+    } else {
+        Err(msg)
+    }
+}
+
 /// Full content of `rel` at `commit_id` — the review editor's file source
 /// when the working tree isn't on the PR head.
 pub fn file_at(root: &Path, commit_id: &str, rel: &str) -> Option<String> {
@@ -404,6 +574,9 @@ mod tests {
         assert!(a.overlay.changed.contains(&(1, LineChange::Modified)), "{:?}", a.overlay.changed);
         assert!(!a.overlay.deleted_before.is_empty());
         assert_eq!((a.added, a.deleted), (1, 2));
+        // The pure-deletion hunk ("four" at end) carries its text for ghost
+        // rows, anchored after the 3 remaining head lines.
+        assert_eq!(a.deleted_text, vec![(3, vec!["four".to_string()])]);
         let b = &s.files[1];
         assert_eq!((b.path.as_str(), b.status), ("b.txt", FileStatus::Added));
         assert_eq!(b.overlay.changed, vec![(0, LineChange::Added)]);

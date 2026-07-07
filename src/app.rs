@@ -86,6 +86,12 @@ struct Tab {
     /// PR-review tab: content comes from the PR head commit (not disk) and
     /// `git_changes` lines are painted as full-width change bands.
     is_review: bool,
+    /// Review ghost rows: display lines holding PR-DELETED code, merged
+    /// inline (struck through). Empty for normal tabs.
+    ghost_rows: Vec<usize>,
+    /// Byte ranges of the ghost rows in `content` (re-applied after any
+    /// re-highlight, e.g. zoom).
+    ghost_ranges: Vec<(usize, usize)>,
 }
 
 impl Tab {
@@ -117,6 +123,8 @@ impl Tab {
             outline,
             git_changes: crate::git::FileDiff::default(),
             is_review: false,
+            ghost_rows: Vec::new(),
+            ghost_ranges: Vec::new(),
         }
     }
 
@@ -128,18 +136,40 @@ impl Tab {
         }
         let font = FontId::monospace(font_size);
         let gutter_color = Color32::from_rgb(0x4b, 0x50, 0x58);
+        let ghost_color = Color32::from_rgba_unmultiplied(0xe0, 0x6c, 0x75, 150);
         let line_h = crate::highlight::line_height(font_size);
-        let digits = self.line_count.to_string().len();
+        // Ghost rows carry no line number ("−" instead), so real numbering
+        // stays identical to the file on disk / at the PR head.
+        let ghost: std::collections::HashSet<usize> = self.ghost_rows.iter().copied().collect();
+        let digits = (self.line_count - self.ghost_rows.len()).to_string().len();
         let mut gutter = LayoutJob::default();
         gutter.wrap.max_width = f32::INFINITY;
-        for n in 1..=self.line_count {
-            let mut fmt = TextFormat::simple(font.clone(), gutter_color);
+        let mut n = 1usize;
+        for row in 0..self.line_count {
+            let (text, color) = if ghost.contains(&row) {
+                (format!("{:>width$}\n", "−", width = digits), ghost_color)
+            } else {
+                let t = format!("{:>width$}\n", n, width = digits);
+                n += 1;
+                (t, gutter_color)
+            };
+            let mut fmt = TextFormat::simple(font.clone(), color);
             fmt.line_height = Some(line_h);
-            gutter.append(&format!("{:>width$}\n", n, width = digits), 0.0, fmt);
+            gutter.append(&text, 0.0, fmt);
         }
         self.gutter_job = gutter;
         self.code_w = ctx.fonts(|f| f.layout_job(self.job.clone())).size().x + 24.0;
         self.render_font = font_size;
+    }
+
+    /// 1-based PR-head line for a display line; None on a ghost row (that
+    /// code doesn't exist at the head, so e.g. it can't take a comment).
+    fn head_line_of(&self, disp: usize) -> Option<usize> {
+        if self.ghost_rows.binary_search(&disp).is_ok() {
+            return None;
+        }
+        let ghosts_before = self.ghost_rows.partition_point(|&g| g < disp);
+        Some(disp - ghosts_before + 1)
     }
 }
 
@@ -485,6 +515,20 @@ pub struct Workspace {
     pr_list_err: Option<String>,
     /// Only PRs whose review is requested from me (default) vs all open PRs.
     pr_list_mine: bool,
+    /// Collapsed directory keys of the REVIEW panel's changed-file tree.
+    review_collapsed: std::collections::HashSet<String>,
+    // Line-comment composer (review tabs).
+    comment_open: bool,
+    comment_path: String,
+    comment_line: usize, // 1-based head line
+    comment_disp: usize, // 0-based display line
+    comment_text: String,
+    comment_focus: bool,
+    // Review submission (approve / comment / request changes).
+    submit_open: bool,
+    submit_body: String,
+    submit_event: usize, // 0 = COMMENT, 1 = APPROVE, 2 = REQUEST_CHANGES
+    submit_rx: Option<Receiver<Result<String, String>>>,
 }
 
 impl Workspace {
@@ -569,6 +613,17 @@ impl Workspace {
             pr_list_rx: None,
             pr_list_err: None,
             pr_list_mine: true,
+            review_collapsed: std::collections::HashSet::new(),
+            comment_open: false,
+            comment_path: String::new(),
+            comment_line: 0,
+            comment_disp: 0,
+            comment_text: String::new(),
+            comment_focus: false,
+            submit_open: false,
+            submit_body: String::new(),
+            submit_event: 0,
+            submit_rx: None,
         }
     }
 
@@ -2430,14 +2485,8 @@ impl CodeLookApp {
             return;
         }
         let path = root.join(&rf.path);
-        let first_change = rf
-            .overlay
-            .changed
-            .first()
-            .map(|&(l, _)| l)
-            .or_else(|| rf.overlay.deleted_before.first().copied())
-            .unwrap_or(0);
         let overlay = rf.overlay.clone();
+        let ghosts = rf.deleted_text.clone();
         let rel = rf.path.clone();
         let head_id = sess.head_id.clone();
         let from_disk = sess.head_is_workdir;
@@ -2461,9 +2510,14 @@ impl CodeLookApp {
                 self.ws.status = format!("PR 파일을 읽을 수 없음: {rel}");
                 return;
             };
-            let job = self
+            // Deleted code comes back as inline ghost rows (struck through),
+            // and the overlay is remapped to the merged document's lines.
+            let (content, overlay, ghost_rows, ghost_ranges) =
+                build_ghost_doc(&content, &overlay, &ghosts);
+            let mut job = self
                 .highlighter
                 .highlight(path.to_str().unwrap_or(""), &content, self.font_size);
+            stylize_ghosts(&mut job, &ghost_ranges);
             let lang = ast::Lang::from_path(&path);
             let outline = lang
                 .map(|l| ast::document_symbols(l, &content))
@@ -2471,10 +2525,27 @@ impl CodeLookApp {
             let mut tab = Tab::new(path.clone(), content, job, self.font_size, lang, outline);
             tab.git_changes = overlay;
             tab.is_review = true;
+            tab.ghost_rows = ghost_rows;
+            tab.ghost_ranges = ghost_ranges;
             self.ws.tabs.push(tab);
             self.ws.active = Some(self.ws.tabs.len() - 1);
             self.refresh_search();
         }
+        // First change in DISPLAY lines (the tab's overlay is already
+        // remapped over any inline ghost rows).
+        let first_change = self
+            .ws
+            .active
+            .and_then(|i| self.ws.tabs.get(i))
+            .map(|t| {
+                let a = t.git_changes.changed.first().map(|&(l, _)| l);
+                let b = t.git_changes.deleted_before.first().copied();
+                match (a, b) {
+                    (Some(x), Some(y)) => x.min(y),
+                    (x, y) => x.or(y).unwrap_or(0),
+                }
+            })
+            .unwrap_or(0);
         self.set_jump_target(first_change);
         self.record_nav(path, first_change);
     }
@@ -2624,6 +2695,7 @@ impl CodeLookApp {
                     &tab.content,
                     self.font_size,
                 );
+                stylize_ghosts(&mut tab.job, &tab.ghost_ranges);
                 tab.job_font = self.font_size;
             }
         }
@@ -2805,6 +2877,32 @@ impl eframe::App for CodeLookApp {
             }
         }
 
+        if let Some(rx) = &self.ws.submit_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.ws.submit_rx = None;
+                match res {
+                    Ok(m) => {
+                        let wt = self
+                            .ws
+                            .project_root
+                            .as_deref()
+                            .is_some_and(crate::review::is_managed_worktree);
+                        self.ws.status = if wt {
+                            format!("리뷰 제출 완료: {m} — 세션 종료 시 워크트리 자동 정리")
+                        } else {
+                            format!("리뷰 제출 완료: {m}")
+                        };
+                        self.ws.submit_open = false;
+                        self.ws.submit_body.clear();
+                        if let Some(s) = self.ws.review.as_mut() {
+                            s.pending.clear();
+                        }
+                    }
+                    Err(e) => self.ws.status = format!("리뷰 제출 실패: {e}"),
+                }
+            }
+        }
+
         if let Some(rx) = &self.ws.pr_list_rx {
             if let Ok(res) = rx.try_recv() {
                 self.ws.pr_list_rx = None;
@@ -2938,6 +3036,8 @@ impl eframe::App for CodeLookApp {
         self.global_search_window(ctx);
         self.finder_window(ctx);
         self.settings_window(ctx);
+        self.comment_window(ctx);
+        self.submit_window(ctx);
     }
 }
 
@@ -3545,12 +3645,15 @@ impl CodeLookApp {
             .as_ref()
             .filter(|d| d.commit_short.starts_with("PR #"))
             .map(|d| d.file.clone());
-        let mut open_file_idx: Option<usize> = None;
-        let mut open_diff_idx: Option<usize> = None;
-        let mut toggle_viewed: Option<usize> = None;
+        let open_file_idx: Option<usize>;
+        let open_diff_idx: Option<usize>;
+        let toggle_viewed: Option<usize>;
+        let toggle_dir: Option<String>;
         let mut close = false;
         let mut reload: Option<u64> = None;
         let mut to_worktree: Option<u64> = None;
+        let mut del_comment: Option<usize> = None;
+        let mut go_comment: Option<(usize, usize)> = None; // (file idx, display line)
 
         {
             let sess = self.ws.review.as_ref().unwrap();
@@ -3657,152 +3760,90 @@ impl CodeLookApp {
             });
             ui.add_space(6.0);
 
-            // Changed-file rows: filename + dim directory, +N −M counts, a
-            // unified-diff button and the viewed check.
+            // Pending line comments — submitted together with the review.
+            if !sess.pending.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(format!("코멘트 {}개 (제출 대기)", sess.pending.len()))
+                            .color(Color32::from_rgb(0xe5, 0xc0, 0x7b))
+                            .size(11.5),
+                    );
+                });
+                for (ci, c) in sess.pending.iter().enumerate() {
+                    let (rr, resp) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 20.0),
+                        Sense::click(),
+                    );
+                    let p = ui.painter();
+                    if resp.hovered() {
+                        p.rect_filled(rr, 0.0, C_HOVER);
+                    }
+                    let file = c.path.rsplit('/').next().unwrap_or(&c.path);
+                    let first = c.body.lines().next().unwrap_or("");
+                    let clip = Rect::from_min_max(rr.min, egui::pos2(rr.right() - 24.0, rr.bottom()));
+                    let pc = ui.painter().with_clip_rect(clip);
+                    pc.text(
+                        egui::pos2(rr.left() + 12.0, rr.center().y),
+                        Align2::LEFT_CENTER,
+                        format!("{file}:{}  {first}", c.line),
+                        FontId::proportional(11.5),
+                        C_TEXT_DIM,
+                    );
+                    let xr = Rect::from_center_size(
+                        egui::pos2(rr.right() - 13.0, rr.center().y),
+                        Vec2::splat(14.0),
+                    );
+                    let xresp = ui.interact(xr, ui.id().with(("rvw_cdel", ci)), Sense::click());
+                    if xresp.hovered() {
+                        ui.painter().rect_filled(xr, 3.0, C_HOVER.gamma_multiply(1.4));
+                    }
+                    draw_x(ui.painter(), xr, if xresp.hovered() { C_TEXT } else { C_TEXT_DIM });
+                    if xresp.on_hover_text("코멘트 삭제").clicked() {
+                        del_comment = Some(ci);
+                    } else if resp.on_hover_text(&c.body).clicked() {
+                        if let Some(fi) = sess.files.iter().position(|f| f.path == c.path) {
+                            go_comment = Some((fi, c.disp_line));
+                        }
+                    }
+                }
+                ui.add_space(4.0);
+            }
+
+            // Changed files as the repo's real hierarchy: collapsible dirs
+            // (single-child chains merged), files beneath.
+            let tree = build_review_tree(&sess.files);
+            let mut acts = RvActs::default();
             egui::ScrollArea::vertical()
                 .id_salt(("review_sidebar", self.ws.seq))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    for (i, f) in sess.files.iter().enumerate() {
-                        let (rr, resp) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), 38.0),
-                            Sense::click(),
-                        );
-                        let is_open = active_rel.as_deref() == Some(f.path.as_str())
-                            || diff_open.as_deref() == Some(f.path.as_str());
-                        {
-                            let p = ui.painter();
-                            if is_open {
-                                p.rect_filled(rr, 0.0, C_SEL);
-                            } else if resp.hovered() {
-                                p.rect_filled(rr, 0.0, C_HOVER);
-                            }
-                        }
-                        let name = f.path.rsplit('/').next().unwrap_or(&f.path);
-                        let dir = f.path[..f.path.len() - name.len()]
-                            .trim_end_matches('/')
-                            .to_string();
-                        let y1 = rr.top() + 12.0;
-                        let y2 = rr.top() + 27.0;
-                        let text_c = if f.viewed { C_TEXT_DIM } else { C_TEXT };
-                        let p = ui.painter();
-                        p.text(
-                            egui::pos2(rr.left() + 10.0, y1),
-                            Align2::LEFT_CENTER,
-                            status_letter(f.status),
-                            FontId::monospace(12.0),
-                            status_color(f.status),
-                        );
-                        // Right-aligned counts on line 1, before the buttons.
-                        let counts_right = rr.right() - 52.0;
-                        let del_g = p.layout_no_wrap(
-                            format!("−{}", f.deleted),
-                            FontId::monospace(10.5),
-                            Color32::from_rgb(0xe0, 0x6c, 0x75),
-                        );
-                        p.galley(
-                            egui::pos2(counts_right - del_g.size().x, y1 - del_g.size().y / 2.0),
-                            del_g.clone(),
-                            Color32::from_rgb(0xe0, 0x6c, 0x75),
-                        );
-                        let add_g = p.layout_no_wrap(
-                            format!("+{} ", f.added),
-                            FontId::monospace(10.5),
-                            Color32::from_rgb(0x62, 0xb5, 0x43),
-                        );
-                        p.galley(
-                            egui::pos2(
-                                counts_right - del_g.size().x - add_g.size().x,
-                                y1 - add_g.size().y / 2.0,
-                            ),
-                            add_g.clone(),
-                            Color32::from_rgb(0x62, 0xb5, 0x43),
-                        );
-                        // Filename (clipped left of the counts) + dim directory.
-                        let name_clip = Rect::from_min_max(
-                            rr.min,
-                            egui::pos2(counts_right - del_g.size().x - add_g.size().x - 4.0, rr.bottom()),
-                        );
-                        let pc = ui.painter().with_clip_rect(name_clip);
-                        pc.text(
-                            egui::pos2(rr.left() + 26.0, y1),
-                            Align2::LEFT_CENTER,
-                            name,
-                            FontId::proportional(12.5),
-                            if is_open { Color32::WHITE } else { text_c },
-                        );
-                        let dir_clip =
-                            Rect::from_min_max(rr.min, egui::pos2(rr.right() - 48.0, rr.bottom()));
-                        let pd = ui.painter().with_clip_rect(dir_clip);
-                        pd.text(
-                            egui::pos2(rr.left() + 26.0, y2),
-                            Align2::LEFT_CENTER,
-                            dir,
-                            FontId::proportional(10.5),
-                            C_TEXT_DIM,
-                        );
-
-                        // Unified-diff button (±) and viewed check, right side.
-                        let diff_r = Rect::from_center_size(
-                            egui::pos2(rr.right() - 38.0, rr.center().y),
-                            Vec2::splat(18.0),
-                        );
-                        let check_r = Rect::from_center_size(
-                            egui::pos2(rr.right() - 15.0, rr.center().y),
-                            Vec2::splat(18.0),
-                        );
-                        let diff_resp =
-                            ui.interact(diff_r, ui.id().with(("rvw_diff", i)), Sense::click());
-                        let check_resp =
-                            ui.interact(check_r, ui.id().with(("rvw_check", i)), Sense::click());
-                        let p = ui.painter();
-                        if diff_resp.hovered() {
-                            p.rect_filled(diff_r, 4.0, C_HOVER);
-                        }
-                        p.text(
-                            diff_r.center(),
-                            Align2::CENTER_CENTER,
-                            "±",
-                            FontId::monospace(13.0),
-                            if diff_resp.hovered() { C_TEXT } else { C_TEXT_DIM },
-                        );
-                        if check_resp.hovered() {
-                            p.rect_filled(check_r, 4.0, C_HOVER);
-                        }
-                        let cc = check_r.center();
-                        if f.viewed {
-                            p.circle_filled(cc, 7.0, Color32::from_rgb(0x62, 0xb5, 0x43));
-                            let st = Stroke::new(1.6, Color32::from_rgb(0x1e, 0x1f, 0x22));
-                            p.line_segment(
-                                [cc + Vec2::new(-3.2, 0.2), cc + Vec2::new(-1.0, 2.4)],
-                                st,
-                            );
-                            p.line_segment(
-                                [cc + Vec2::new(-1.0, 2.4), cc + Vec2::new(3.4, -2.4)],
-                                st,
-                            );
-                        } else {
-                            p.circle_stroke(
-                                cc,
-                                7.0,
-                                Stroke::new(1.2, if check_resp.hovered() { C_TEXT } else { C_TEXT_DIM }),
-                            );
-                        }
-
-                        if check_resp.on_hover_text("검토 완료 표시").clicked() {
-                            toggle_viewed = Some(i);
-                        } else if diff_resp.on_hover_text("diff로 보기").clicked() {
-                            open_diff_idx = Some(i);
-                        } else if resp.on_hover_text(&f.path).clicked() {
-                            open_file_idx = Some(i);
-                        }
-                    }
+                    review_tree_rows(
+                        ui,
+                        &tree,
+                        0,
+                        &sess.files,
+                        &self.ws.review_collapsed,
+                        active_rel.as_deref(),
+                        diff_open.as_deref(),
+                        &self.icons,
+                        &mut acts,
+                    );
                     ui.add_space(6.0);
                 });
+            toggle_viewed = acts.toggle_viewed;
+            open_file_idx = acts.open_file;
+            open_diff_idx = acts.open_diff;
+            toggle_dir = acts.toggle_dir;
         }
 
         // Deferred mutations.
+        if let Some(k) = toggle_dir {
+            if !self.ws.review_collapsed.remove(&k) {
+                self.ws.review_collapsed.insert(k);
+            }
+        }
         if let Some(i) = toggle_viewed {
             if let Some(s) = self.ws.review.as_mut() {
                 if let Some(f) = s.files.get_mut(i) {
@@ -3815,6 +3856,17 @@ impl CodeLookApp {
         }
         if let Some(i) = open_diff_idx {
             self.open_review_diff(i);
+        }
+        if let Some(ci) = del_comment {
+            if let Some(s) = self.ws.review.as_mut() {
+                if ci < s.pending.len() {
+                    s.pending.remove(ci);
+                }
+            }
+        }
+        if let Some((fi, disp)) = go_comment {
+            self.open_review_file(fi);
+            self.set_jump_target(disp);
         }
         if let Some(n) = reload {
             let ctx = ui.ctx().clone();
@@ -3843,6 +3895,23 @@ impl CodeLookApp {
                 .is_some_and(|d| d.commit_short.starts_with("PR #"))
             {
                 self.ws.diff_view = None;
+            }
+            // Reviewing in a dedicated worktree: closing the session also
+            // tears the worktree down (checkout copy only) and returns to
+            // the original project — no leftovers on disk.
+            if let Some(root) = self.ws.project_root.clone() {
+                if crate::review::is_managed_worktree(&root) {
+                    let main = crate::git::main_worktree_root(&root).filter(|m| *m != root);
+                    let ctx = ui.ctx().clone();
+                    self.close_project(&root);
+                    if let Some(m) = main {
+                        self.open_project(&ctx, m);
+                    }
+                    self.ws.status = "리뷰 워크트리 정리 중…".to_string();
+                    std::thread::spawn(move || {
+                        let _ = crate::review::remove_worktree(&root);
+                    });
+                }
             }
         }
     }
@@ -4697,10 +4766,13 @@ impl CodeLookApp {
         let up_tip = format!("이전 변경 ({})", self.keymap.text(crate::keymap::Action::PrevChange));
         let down_tip = format!("다음 변경 ({})", self.keymap.text(crate::keymap::Action::NextChange));
 
+        let n_comments = sess.pending.len();
         let mut dir = 0isize;
         let mut to_source = false;
         let mut flip_viewed = false;
         let mut next_file = false;
+        let mut add_comment = false;
+        let mut open_submit = false;
 
         let resp = egui::Frame::default()
             .fill(C_PANEL)
@@ -4740,9 +4812,44 @@ impl CodeLookApp {
                             .color(Color32::from_rgb(0xe0, 0x6c, 0x75))
                             .size(11.0),
                     );
+                    sep_dot(ui);
+                    let c_label = if n_comments > 0 {
+                        format!("코멘트 {n_comments}")
+                    } else {
+                        "코멘트".to_string()
+                    };
+                    if ui
+                        .small_button(c_label)
+                        .on_hover_text("커서 라인에 리뷰 코멘트 달기 (제출 시 함께 전송)")
+                        .clicked()
+                    {
+                        add_comment = true;
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
+                        let all_done = viewed_files == total_files && total_files > 0;
+                        let submit = egui::Button::new(
+                            egui::RichText::new("리뷰 제출").size(11.5).color(
+                                if all_done {
+                                    Color32::from_rgb(0x1e, 0x1f, 0x22)
+                                } else {
+                                    C_TEXT
+                                },
+                            ),
+                        )
+                        .fill(if all_done {
+                            Color32::from_rgb(0x62, 0xb5, 0x43)
+                        } else {
+                            C_HOVER
+                        });
+                        if ui
+                            .add(submit)
+                            .on_hover_text("승인 / 코멘트 / 변경 요청을 GitHub에 제출")
+                            .clicked()
+                        {
+                            open_submit = true;
+                        }
                         if fi.is_some() {
                             if ui
                                 .small_button("다음 파일")
@@ -4811,9 +4918,214 @@ impl CodeLookApp {
             }
             match open_next {
                 Some(j) => self.open_review_file(j),
-                None => self.ws.status = "모든 파일 검토 완료".to_string(),
+                None => {
+                    self.ws.status =
+                        "모든 파일 검토 완료 — [리뷰 제출]로 마무리하세요".to_string();
+                    self.ws.submit_open = true;
+                }
             }
         }
+        if add_comment {
+            let t = &self.ws.tabs[idx];
+            match t.caret_line.or(t.flash_line) {
+                None => self.ws.status = "코멘트할 라인을 먼저 클릭하세요".to_string(),
+                Some(disp) => match t.head_line_of(disp) {
+                    None => {
+                        self.ws.status =
+                            "삭제된(고스트) 라인에는 코멘트를 달 수 없습니다".to_string()
+                    }
+                    Some(hl) => {
+                        self.ws.comment_open = true;
+                        self.ws.comment_path = rel.clone();
+                        self.ws.comment_line = hl;
+                        self.ws.comment_disp = disp;
+                        self.ws.comment_text.clear();
+                        self.ws.comment_focus = true;
+                    }
+                },
+            }
+        }
+        if open_submit {
+            self.ws.submit_open = true;
+        }
+    }
+
+    /// Line-comment composer: writes into the session's pending list; the
+    /// comments go to GitHub together with the review submission.
+    fn comment_window(&mut self, ctx: &egui::Context) {
+        if !self.ws.comment_open {
+            return;
+        }
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("라인 코멘트")
+            .id(egui::Id::new(("comment_win", self.ws.seq)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(440.0)
+            .default_pos(ctx.screen_rect().center() - Vec2::new(220.0, 140.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}:{}",
+                        self.ws.comment_path, self.ws.comment_line
+                    ))
+                    .color(C_TEXT_DIM)
+                    .size(11.5),
+                );
+                ui.add_space(4.0);
+                let resp = ui.add(
+                    egui::TextEdit::multiline(&mut self.ws.comment_text)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("리뷰 코멘트…"),
+                );
+                if self.ws.comment_focus {
+                    resp.request_focus();
+                    self.ws.comment_focus = false;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("추가").clicked() {
+                        save = true;
+                    }
+                    if ui.button("취소").clicked() {
+                        cancel = true;
+                    }
+                    ui.label(
+                        egui::RichText::new("제출 전까지 로컬에만 보관됩니다")
+                            .color(C_TEXT_DIM)
+                            .size(10.5),
+                    );
+                });
+            });
+        if save && !self.ws.comment_text.trim().is_empty() {
+            let c = crate::review::PendingComment {
+                path: self.ws.comment_path.clone(),
+                line: self.ws.comment_line,
+                disp_line: self.ws.comment_disp,
+                body: self.ws.comment_text.trim().to_string(),
+            };
+            if let Some(s) = self.ws.review.as_mut() {
+                s.pending.push(c);
+                self.ws.status = format!("코멘트 추가 (대기 {}개)", s.pending.len());
+            }
+            self.ws.comment_open = false;
+        }
+        if cancel || !open {
+            self.ws.comment_open = false;
+        }
+    }
+
+    /// Review submission: approve / comment / request-changes with a summary
+    /// body, sending the queued line comments along.
+    fn submit_window(&mut self, ctx: &egui::Context) {
+        if !self.ws.submit_open {
+            return;
+        }
+        let Some((pr_no, viewed, total, n_comments)) = self
+            .ws
+            .review
+            .as_ref()
+            .map(|s| (s.pr.number, s.viewed_count(), s.files.len(), s.pending.len()))
+        else {
+            self.ws.submit_open = false;
+            return;
+        };
+        let mut open = true;
+        let mut do_submit = false;
+        egui::Window::new("리뷰 제출")
+            .id(egui::Id::new(("submit_win", self.ws.seq)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(480.0)
+            .default_pos(ctx.screen_rect().center() - Vec2::new(240.0, 170.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "PR #{pr_no} · 검토 {viewed}/{total} 파일 · 라인 코멘트 {n_comments}개 포함"
+                    ))
+                    .color(C_TEXT_DIM)
+                    .size(11.5),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    for (i, label) in ["코멘트만", "승인 (Approve)", "변경 요청"].iter().enumerate()
+                    {
+                        if ui
+                            .selectable_label(self.ws.submit_event == i, *label)
+                            .clicked()
+                        {
+                            self.ws.submit_event = i;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.ws.submit_body)
+                        .desired_rows(5)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("리뷰 총평 — 승인은 비워도 됩니다"),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if self.ws.submit_rx.is_some() {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("제출 중…").color(C_TEXT_DIM).size(11.5),
+                        );
+                    } else if ui.button("GitHub에 제출").clicked() {
+                        do_submit = true;
+                    }
+                });
+            });
+        if !open {
+            self.ws.submit_open = false;
+        }
+        if do_submit {
+            self.do_submit(ctx);
+        }
+    }
+
+    fn do_submit(&mut self, ctx: &egui::Context) {
+        if self.ws.submit_rx.is_some() {
+            return;
+        }
+        let Some(sess) = self.ws.review.as_ref() else {
+            return;
+        };
+        let Some(root) = self.ws.project_root.clone() else {
+            return;
+        };
+        let event = match self.ws.submit_event {
+            1 => "APPROVE",
+            2 => "REQUEST_CHANGES",
+            _ => "COMMENT",
+        };
+        // GitHub rejects an empty COMMENT / REQUEST_CHANGES review.
+        if event != "APPROVE" && self.ws.submit_body.trim().is_empty() && sess.pending.is_empty()
+        {
+            self.ws.status = "본문 또는 라인 코멘트가 필요합니다".to_string();
+            return;
+        }
+        let number = sess.pr.number;
+        let head = sess.head_id.clone();
+        let body = self.ws.submit_body.trim().to_string();
+        let comments = sess.pending.clone();
+        let event = event.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::review::submit_review(
+                &root, number, &head, &event, &body, &comments,
+            ));
+            c.request_repaint();
+        });
+        self.ws.submit_rx = Some(rx);
+        self.ws.status = "리뷰 제출 중…".to_string();
     }
 
     /// Render the open commit diff (header + unified diff body).
@@ -5222,6 +5534,28 @@ impl CodeLookApp {
         // Build (or reuse cached) gutter + code width — only rebuilt on font change.
         let ctx = ui.ctx().clone();
         self.ws.tabs[idx].ensure_render(&ctx, self.font_size);
+        let pane = ui.max_rect();
+
+        // Pending review comments on this file (display rows, for markers).
+        let comment_rows: Vec<usize> = if self.ws.tabs[idx].is_review {
+            let rel = self
+                .ws
+                .project_root
+                .as_ref()
+                .and_then(|r| self.ws.tabs[idx].path.strip_prefix(r).ok())
+                .map(|p| p.to_string_lossy().to_string());
+            match (rel, self.ws.review.as_ref()) {
+                (Some(rel), Some(s)) => s
+                    .pending
+                    .iter()
+                    .filter(|c| c.path == rel)
+                    .map(|c| c.disp_line)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
 
         // Layouter feeds the cached highlighted job to the TextEdit.
         let job_for_layouter = self.ws.tabs[idx].job.clone();
@@ -5234,6 +5568,7 @@ impl CodeLookApp {
         let mut clear_scroll = false;
         let mut clicked_nothing = false;
         let mut caret_clicked: Option<usize> = None;
+        let mut comment_at: Option<usize> = None;
 
         // Borrow the single tab so edit_buf / content can be touched independently.
         let tab = &mut self.ws.tabs[idx];
@@ -5281,19 +5616,22 @@ impl CodeLookApp {
                                 col,
                             );
                         }
-                        // Deletion markers: a small gray triangle at the boundary.
-                        for &line in &tab.git_changes.deleted_before {
-                            let y = g_rect.top() + line as f32 * lh;
-                            let c = Color32::from_rgb(0x9a, 0x9a, 0x9a);
-                            p.add(egui::Shape::convex_polygon(
-                                vec![
-                                    egui::pos2(bx, y - 3.5),
-                                    egui::pos2(bx, y + 3.5),
-                                    egui::pos2(bx + 5.0, y),
-                                ],
-                                c,
-                                Stroke::NONE,
-                            ));
+                        // Deletion markers: a small gray triangle at the
+                        // boundary. Review tabs show ghost rows instead.
+                        if !tab.is_review {
+                            for &line in &tab.git_changes.deleted_before {
+                                let y = g_rect.top() + line as f32 * lh;
+                                let c = Color32::from_rgb(0x9a, 0x9a, 0x9a);
+                                p.add(egui::Shape::convex_polygon(
+                                    vec![
+                                        egui::pos2(bx, y - 3.5),
+                                        egui::pos2(bx, y + 3.5),
+                                        egui::pos2(bx + 5.0, y),
+                                    ],
+                                    c,
+                                    Stroke::NONE,
+                                ));
+                            }
                         }
                     }
 
@@ -5367,12 +5705,44 @@ impl CodeLookApp {
                                 col,
                             );
                         }
-                        for &line in &tab.git_changes.deleted_before {
-                            let y = out.galley_pos.y + row_h * line as f32;
-                            p.line_segment(
-                                [egui::pos2(band_left, y), egui::pos2(band_right, y)],
-                                Stroke::new(1.5, Color32::from_rgba_unmultiplied(0xe0, 0x6c, 0x75, 150)),
+                        // Ghost rows (PR-deleted code, struck through in the
+                        // text): a reddish band marks them as not-in-head.
+                        for &row in &tab.ghost_rows {
+                            let y = out.galley_pos.y + row_h * row as f32;
+                            p.rect_filled(
+                                Rect::from_min_max(
+                                    egui::pos2(band_left, y),
+                                    egui::pos2(band_right, y + row_h),
+                                ),
+                                0.0,
+                                Color32::from_rgba_unmultiplied(0xe0, 0x6c, 0x75, 20),
                             );
+                        }
+                        // Pending-comment lines: a soft yellow band.
+                        for &row in &comment_rows {
+                            let y = out.galley_pos.y + row_h * row as f32;
+                            p.rect_filled(
+                                Rect::from_min_max(
+                                    egui::pos2(band_left, y),
+                                    egui::pos2(band_right, y + row_h),
+                                ),
+                                0.0,
+                                Color32::from_rgba_unmultiplied(0xe5, 0xc0, 0x7b, 18),
+                            );
+                        }
+                        // Fallback seam when a deletion has no ghost text
+                        // (e.g. undecodable content).
+                        if tab.ghost_rows.is_empty() {
+                            for &line in &tab.git_changes.deleted_before {
+                                let y = out.galley_pos.y + row_h * line as f32;
+                                p.line_segment(
+                                    [egui::pos2(band_left, y), egui::pos2(band_right, y)],
+                                    Stroke::new(
+                                        1.5,
+                                        Color32::from_rgba_unmultiplied(0xe0, 0x6c, 0x75, 150),
+                                    ),
+                                );
+                            }
                         }
                     }
 
@@ -5402,6 +5772,54 @@ impl CodeLookApp {
                             0.0,
                             Color32::from_rgba_unmultiplied(0x3a, 0x55, 0x6e, 96),
                         );
+                    }
+
+                    // Review tabs: hovering a line shows a "+" on its gutter
+                    // number (GitHub-style) — click to comment that line.
+                    if tab.is_review {
+                        if let Some(pos) = ui.ctx().pointer_hover_pos() {
+                            let row = ((pos.y - out.galley_pos.y) / row_h).floor();
+                            if ui.clip_rect().contains(pos)
+                                && pos.x >= band_left
+                                && row >= 0.0
+                                && (row as usize) < tab.line_count
+                            {
+                                let row = row as usize;
+                                let y = out.galley_pos.y + row_h * row as f32;
+                                let cr = Rect::from_center_size(
+                                    egui::pos2(g_rect.right() - 7.0, y + row_h / 2.0),
+                                    Vec2::splat(14.0),
+                                );
+                                let resp = ui.interact(
+                                    cr,
+                                    ui.id().with(("cmt_add", row)),
+                                    Sense::click(),
+                                );
+                                let p = ui.painter();
+                                let bg = if resp.hovered() {
+                                    C_ACCENT
+                                } else {
+                                    C_ACCENT.gamma_multiply(0.72)
+                                };
+                                p.rect_filled(cr, 3.0, bg);
+                                let c = cr.center();
+                                let st = Stroke::new(1.6, Color32::WHITE);
+                                p.line_segment(
+                                    [c + Vec2::new(-3.5, 0.0), c + Vec2::new(3.5, 0.0)],
+                                    st,
+                                );
+                                p.line_segment(
+                                    [c + Vec2::new(0.0, -3.5), c + Vec2::new(0.0, 3.5)],
+                                    st,
+                                );
+                                if resp.hovered() {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                if resp.on_hover_text("이 라인에 코멘트").clicked() {
+                                    comment_at = Some(row);
+                                }
+                            }
+                        }
                     }
 
                     // ⌘+Click → go to definition.
@@ -5442,12 +5860,85 @@ impl CodeLookApp {
                 });
             });
 
+        // Overview ruler (IntelliJ error-stripe style): every change's
+        // position over the WHOLE file, painted along the right edge so the
+        // scrollbar area shows where the changes live.
+        {
+            let t = &self.ws.tabs[idx];
+            let has_marks = !t.git_changes.changed.is_empty()
+                || !t.ghost_rows.is_empty()
+                || !t.git_changes.deleted_before.is_empty()
+                || !comment_rows.is_empty();
+            if has_marks {
+                let p = ui.painter();
+                let total = t.line_count.max(1) as f32;
+                let (x1, x2) = (pane.right() - 6.0, pane.right() - 1.0);
+                let mh = (pane.height() / total).max(2.0);
+                let y_of = |line: usize| pane.top() + pane.height() * (line as f32 / total);
+                let mark = |line: usize, col: Color32| {
+                    let y = y_of(line);
+                    p.rect_filled(
+                        Rect::from_min_max(egui::pos2(x1, y), egui::pos2(x2, y + mh)),
+                        0.0,
+                        col,
+                    );
+                };
+                for &(line, kind) in &t.git_changes.changed {
+                    let col = match kind {
+                        crate::git::LineChange::Added => {
+                            Color32::from_rgba_unmultiplied(0x62, 0xb5, 0x43, 190)
+                        }
+                        crate::git::LineChange::Modified => {
+                            Color32::from_rgba_unmultiplied(0x6c, 0x9c, 0xd2, 190)
+                        }
+                    };
+                    mark(line, col);
+                }
+                let del = Color32::from_rgba_unmultiplied(0xe0, 0x6c, 0x75, 190);
+                if t.is_review {
+                    for &row in &t.ghost_rows {
+                        mark(row, del);
+                    }
+                } else {
+                    for &line in &t.git_changes.deleted_before {
+                        mark(line, del);
+                    }
+                }
+                for &row in &comment_rows {
+                    mark(row, Color32::from_rgba_unmultiplied(0xe5, 0xc0, 0x7b, 210));
+                }
+            }
+        }
+
         // Every plain click is a navigation point (IntelliJ-style): Back walks
         // through previous click positions, not only through jumps. Clicks on
         // nearby lines refine the current entry instead of flooding history.
         if let Some(line) = caret_clicked {
             if !ctx.input(|i| i.modifiers.command || i.modifiers.ctrl) {
                 self.note_click_nav(line);
+            }
+        }
+
+        // Gutter "+" clicked: open the comment composer for that line.
+        if let Some(row) = comment_at {
+            let root = self.ws.project_root.clone().unwrap_or_default();
+            let t = &mut self.ws.tabs[idx];
+            t.caret_line = Some(row);
+            match t.head_line_of(row) {
+                None => {
+                    self.ws.status =
+                        "삭제된(고스트) 라인에는 코멘트를 달 수 없습니다".to_string()
+                }
+                Some(hl) => {
+                    if let Ok(rel) = t.path.strip_prefix(&root) {
+                        self.ws.comment_path = rel.to_string_lossy().to_string();
+                        self.ws.comment_line = hl;
+                        self.ws.comment_disp = row;
+                        self.ws.comment_text.clear();
+                        self.ws.comment_open = true;
+                        self.ws.comment_focus = true;
+                    }
+                }
             }
         }
 
@@ -5459,6 +5950,361 @@ impl CodeLookApp {
         }
         if let Some(w) = goto {
             self.goto_definition(&w);
+        }
+    }
+}
+
+/// Merge PR-deleted lines back into the head document as inline "ghost"
+/// rows, so a reviewer sees WHAT was removed in place. Returns the merged
+/// doc, the overlay remapped to display lines (with ghost group starts in
+/// `deleted_before` for change navigation), the ghost row indices, and the
+/// ghost byte ranges (for strikethrough styling).
+fn build_ghost_doc(
+    head: &str,
+    overlay: &crate::git::FileDiff,
+    ghosts: &[(usize, Vec<String>)],
+) -> (String, crate::git::FileDiff, Vec<usize>, Vec<(usize, usize)>) {
+    if ghosts.is_empty() {
+        return (head.to_string(), overlay.clone(), Vec::new(), Vec::new());
+    }
+    let head_lines: Vec<&str> = head.lines().collect();
+    let mut sorted: Vec<(usize, &Vec<String>)> = ghosts.iter().map(|(a, v)| (*a, v)).collect();
+    sorted.sort_by_key(|g| g.0);
+
+    let mut out = String::new();
+    let mut ghost_rows = Vec::new();
+    let mut ghost_ranges = Vec::new();
+    let mut group_starts = Vec::new();
+    // For head line h: how many ghost rows were inserted above it.
+    let mut offset_at = vec![0usize; head_lines.len() + 1];
+    let (mut gi, mut off, mut disp) = (0usize, 0usize, 0usize);
+    for h in 0..=head_lines.len() {
+        while gi < sorted.len() && sorted[gi].0.min(head_lines.len()) == h {
+            group_starts.push(disp);
+            for t in sorted[gi].1 {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                let start = out.len();
+                out.push_str(t);
+                ghost_ranges.push((start, out.len()));
+                ghost_rows.push(disp);
+                disp += 1;
+                off += 1;
+            }
+            gi += 1;
+        }
+        offset_at[h] = off;
+        if h < head_lines.len() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(head_lines[h]);
+            disp += 1;
+        }
+    }
+    let changed = overlay
+        .changed
+        .iter()
+        .map(|&(l, k)| (l + offset_at[l.min(head_lines.len())], k))
+        .collect();
+    let fd = crate::git::FileDiff {
+        changed,
+        deleted_before: group_starts,
+    };
+    (out, fd, ghost_rows, ghost_ranges)
+}
+
+/// Restyle a highlighted job so the ghost byte ranges render dimmed and
+/// struck through. Sections are split at range boundaries; both lists are
+/// sorted, ranges never overlap.
+fn stylize_ghosts(job: &mut LayoutJob, ranges: &[(usize, usize)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    let strike = Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xe0, 0x6c, 0x75, 170));
+    let mut out: Vec<egui::text::LayoutSection> = Vec::with_capacity(job.sections.len() + ranges.len());
+    for sec in &job.sections {
+        let (s, e) = (sec.byte_range.start, sec.byte_range.end);
+        let mut cur = s;
+        for &(gs, ge) in ranges {
+            if ge <= cur || gs >= e {
+                continue;
+            }
+            let (a, b) = (gs.max(cur), ge.min(e));
+            if a > cur {
+                let mut plain = sec.clone();
+                plain.byte_range = cur..a;
+                out.push(plain);
+            }
+            let mut ghost = sec.clone();
+            ghost.byte_range = a..b;
+            ghost.format.color = ghost.format.color.gamma_multiply(0.55);
+            ghost.format.strikethrough = strike;
+            out.push(ghost);
+            cur = b;
+        }
+        if cur < e || s == e {
+            let mut rest = sec.clone();
+            rest.byte_range = cur..e;
+            out.push(rest);
+        }
+    }
+    job.sections = out;
+}
+
+/// Directory node of the REVIEW panel's changed-file tree. Single-child
+/// directory chains collapse into one "a/b/c" row (IntelliJ-style), so deep
+/// monorepo paths stay one or two levels of indentation.
+#[derive(Default)]
+struct RvNode {
+    name: String,
+    /// Full relative dir path — the collapse-state id.
+    key: String,
+    children: Vec<RvNode>,
+    /// Indices into `ReviewSession::files` located directly in this dir.
+    files: Vec<usize>,
+}
+
+#[derive(Default)]
+struct RvActs {
+    open_file: Option<usize>,
+    open_diff: Option<usize>,
+    toggle_viewed: Option<usize>,
+    toggle_dir: Option<String>,
+}
+
+fn build_review_tree(files: &[crate::review::ReviewFile]) -> RvNode {
+    let mut root = RvNode::default();
+    for (i, f) in files.iter().enumerate() {
+        let mut comps: Vec<&str> = f.path.split('/').collect();
+        comps.pop(); // file name
+        let mut cur = &mut root;
+        let mut key = String::new();
+        for c in comps {
+            if !key.is_empty() {
+                key.push('/');
+            }
+            key.push_str(c);
+            let pos = match cur.children.iter().position(|n| n.name == c) {
+                Some(p) => p,
+                None => {
+                    cur.children.push(RvNode {
+                        name: c.to_string(),
+                        key: key.clone(),
+                        ..Default::default()
+                    });
+                    cur.children.len() - 1
+                }
+            };
+            cur = &mut cur.children[pos];
+        }
+        cur.files.push(i);
+    }
+    collapse_chains(&mut root);
+    sort_tree(&mut root);
+    root
+}
+
+fn collapse_chains(node: &mut RvNode) {
+    for c in &mut node.children {
+        collapse_chains(c);
+    }
+    for c in &mut node.children {
+        while c.files.is_empty() && c.children.len() == 1 {
+            let g = c.children.remove(0);
+            c.name = format!("{}/{}", c.name, g.name);
+            c.key = g.key;
+            c.children = g.children;
+            c.files = g.files;
+        }
+    }
+}
+
+fn sort_tree(node: &mut RvNode) {
+    node.children.sort_by(|a, b| a.name.cmp(&b.name));
+    for c in &mut node.children {
+        sort_tree(c);
+    }
+}
+
+fn count_rv_files(node: &RvNode) -> usize {
+    node.files.len() + node.children.iter().map(count_rv_files).sum::<usize>()
+}
+
+/// Render the changed-file tree: directory rows (collapsible) first, then
+/// this dir's files. Clicks land in `acts` and are applied by the caller.
+#[allow(clippy::too_many_arguments)]
+fn review_tree_rows(
+    ui: &mut egui::Ui,
+    node: &RvNode,
+    depth: usize,
+    files: &[crate::review::ReviewFile],
+    collapsed: &std::collections::HashSet<String>,
+    active_rel: Option<&str>,
+    diff_open: Option<&str>,
+    icons: &icons::IconSet,
+    acts: &mut RvActs,
+) {
+    let indent = 8.0 + depth as f32 * 12.0;
+    for c in &node.children {
+        let (rr, resp) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::click());
+        let p = ui.painter();
+        if resp.hovered() {
+            p.rect_filled(rr, 0.0, C_HOVER);
+        }
+        let open = !collapsed.contains(&c.key);
+        let tc = C_TEXT_DIM;
+        let cx = rr.left() + indent + 4.0;
+        let cy = rr.center().y;
+        let tri = if open {
+            vec![
+                egui::pos2(cx - 3.5, cy - 2.0),
+                egui::pos2(cx + 3.5, cy - 2.0),
+                egui::pos2(cx, cy + 3.0),
+            ]
+        } else {
+            vec![
+                egui::pos2(cx - 2.0, cy - 3.5),
+                egui::pos2(cx - 2.0, cy + 3.5),
+                egui::pos2(cx + 3.0, cy),
+            ]
+        };
+        p.add(egui::Shape::convex_polygon(tri, tc, Stroke::NONE));
+        let ir = Rect::from_center_size(egui::pos2(rr.left() + indent + 17.0, cy), Vec2::splat(14.0));
+        icons.folder(p, ir, &c.name, open);
+        let clip = Rect::from_min_max(rr.min, egui::pos2(rr.right() - 8.0, rr.bottom()));
+        let pc = ui.painter().with_clip_rect(clip);
+        let name_r = pc.text(
+            egui::pos2(rr.left() + indent + 28.0, cy),
+            Align2::LEFT_CENTER,
+            &c.name,
+            FontId::proportional(12.0),
+            C_TEXT_DIM,
+        );
+        pc.text(
+            egui::pos2(name_r.right() + 6.0, cy),
+            Align2::LEFT_CENTER,
+            count_rv_files(c).to_string(),
+            FontId::proportional(10.5),
+            C_TEXT_DIM.gamma_multiply(0.7),
+        );
+        if resp.on_hover_text(&c.key).clicked() {
+            acts.toggle_dir = Some(c.key.clone());
+        }
+        if open {
+            review_tree_rows(ui, c, depth + 1, files, collapsed, active_rel, diff_open, icons, acts);
+        }
+    }
+
+    for &i in &node.files {
+        let f = &files[i];
+        let (rr, resp) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::click());
+        let is_open =
+            active_rel == Some(f.path.as_str()) || diff_open == Some(f.path.as_str());
+        {
+            let p = ui.painter();
+            if is_open {
+                p.rect_filled(rr, 0.0, C_SEL);
+            } else if resp.hovered() {
+                p.rect_filled(rr, 0.0, C_HOVER);
+            }
+        }
+        let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+        let cy = rr.center().y;
+        let text_c = if f.viewed { C_TEXT_DIM } else { C_TEXT };
+        let p = ui.painter();
+        p.text(
+            egui::pos2(rr.left() + indent + 2.0, cy),
+            Align2::LEFT_CENTER,
+            status_letter(f.status),
+            FontId::monospace(11.5),
+            status_color(f.status),
+        );
+        // Right-aligned counts, then the ± and viewed buttons.
+        let counts_right = rr.right() - 52.0;
+        let del_g = p.layout_no_wrap(
+            format!("−{}", f.deleted),
+            FontId::monospace(10.0),
+            Color32::from_rgb(0xe0, 0x6c, 0x75),
+        );
+        p.galley(
+            egui::pos2(counts_right - del_g.size().x, cy - del_g.size().y / 2.0),
+            del_g.clone(),
+            Color32::from_rgb(0xe0, 0x6c, 0x75),
+        );
+        let add_g = p.layout_no_wrap(
+            format!("+{} ", f.added),
+            FontId::monospace(10.0),
+            Color32::from_rgb(0x62, 0xb5, 0x43),
+        );
+        p.galley(
+            egui::pos2(
+                counts_right - del_g.size().x - add_g.size().x,
+                cy - add_g.size().y / 2.0,
+            ),
+            add_g.clone(),
+            Color32::from_rgb(0x62, 0xb5, 0x43),
+        );
+        let name_clip = Rect::from_min_max(
+            rr.min,
+            egui::pos2(counts_right - del_g.size().x - add_g.size().x - 4.0, rr.bottom()),
+        );
+        let pc = ui.painter().with_clip_rect(name_clip);
+        pc.text(
+            egui::pos2(rr.left() + indent + 16.0, cy),
+            Align2::LEFT_CENTER,
+            name,
+            FontId::proportional(12.5),
+            if is_open { Color32::WHITE } else { text_c },
+        );
+
+        let diff_r = Rect::from_center_size(
+            egui::pos2(rr.right() - 38.0, cy),
+            Vec2::splat(16.0),
+        );
+        let check_r = Rect::from_center_size(
+            egui::pos2(rr.right() - 15.0, cy),
+            Vec2::splat(16.0),
+        );
+        let diff_resp = ui.interact(diff_r, ui.id().with(("rvw_diff", i)), Sense::click());
+        let check_resp = ui.interact(check_r, ui.id().with(("rvw_check", i)), Sense::click());
+        let p = ui.painter();
+        if diff_resp.hovered() {
+            p.rect_filled(diff_r, 4.0, C_HOVER);
+        }
+        p.text(
+            diff_r.center(),
+            Align2::CENTER_CENTER,
+            "±",
+            FontId::monospace(12.0),
+            if diff_resp.hovered() { C_TEXT } else { C_TEXT_DIM },
+        );
+        if check_resp.hovered() {
+            p.rect_filled(check_r, 4.0, C_HOVER);
+        }
+        let cc = check_r.center();
+        if f.viewed {
+            p.circle_filled(cc, 6.5, Color32::from_rgb(0x62, 0xb5, 0x43));
+            let st = Stroke::new(1.5, Color32::from_rgb(0x1e, 0x1f, 0x22));
+            p.line_segment([cc + Vec2::new(-3.0, 0.2), cc + Vec2::new(-1.0, 2.2)], st);
+            p.line_segment([cc + Vec2::new(-1.0, 2.2), cc + Vec2::new(3.2, -2.2)], st);
+        } else {
+            p.circle_stroke(
+                cc,
+                6.5,
+                Stroke::new(1.2, if check_resp.hovered() { C_TEXT } else { C_TEXT_DIM }),
+            );
+        }
+
+        if check_resp.on_hover_text("검토 완료 표시").clicked() {
+            acts.toggle_viewed = Some(i);
+        } else if diff_resp.on_hover_text("diff로 보기").clicked() {
+            acts.open_diff = Some(i);
+        } else if resp.on_hover_text(&f.path).clicked() {
+            acts.open_file = Some(i);
         }
     }
 }
@@ -6156,7 +7002,7 @@ fn apply_theme(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::word_at;
+    use super::{build_ghost_doc, word_at};
 
     #[test]
     fn picks_identifier_under_cursor() {
@@ -6180,5 +7026,38 @@ mod tests {
         // char index of the Korean identifier start
         let ci = s.chars().take_while(|c| *c != '사').count();
         assert_eq!(word_at(s, ci).as_deref(), Some("사용자이름"));
+    }
+
+    #[test]
+    fn ghost_doc_merges_and_remaps() {
+        use crate::git::{FileDiff, LineChange};
+        // head: a / b / c — one modified line (b), two lines deleted after a.
+        let overlay = FileDiff {
+            changed: vec![(1, LineChange::Modified)],
+            deleted_before: vec![0],
+        };
+        let ghosts = vec![(1usize, vec!["X".to_string(), "Y".to_string()])];
+        let (doc, fd, rows, ranges) = build_ghost_doc("a\nb\nc", &overlay, &ghosts);
+        assert_eq!(doc, "a\nX\nY\nb\nc");
+        // Ghosts occupy display rows 1-2; the modified head line 1 shifts to 3.
+        assert_eq!(rows, vec![1, 2]);
+        assert_eq!(fd.changed, vec![(3, LineChange::Modified)]);
+        assert_eq!(fd.deleted_before, vec![1]); // block-nav stop at the group
+        // Byte ranges point at exactly "X" and "Y".
+        let texts: Vec<&str> = ranges.iter().map(|&(s, e)| &doc[s..e]).collect();
+        assert_eq!(texts, vec!["X", "Y"]);
+        // Display→head mapping skips ghosts: rows 3,4 are head lines 2,3.
+        let mut tab_rows = rows.clone();
+        tab_rows.sort_unstable();
+        let head_of = |disp: usize| {
+            if tab_rows.binary_search(&disp).is_ok() {
+                return None;
+            }
+            Some(disp - tab_rows.partition_point(|&g| g < disp) + 1)
+        };
+        assert_eq!(head_of(0), Some(1));
+        assert_eq!(head_of(1), None);
+        assert_eq!(head_of(3), Some(2));
+        assert_eq!(head_of(4), Some(3));
     }
 }
