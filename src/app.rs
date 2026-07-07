@@ -86,6 +86,8 @@ struct Tab {
     /// PR-review tab: content comes from the PR head commit (not disk) and
     /// `git_changes` lines are painted as full-width change bands.
     is_review: bool,
+    /// Markdown tab showing the RENDERED document instead of raw text.
+    md_preview: bool,
     /// Review ghost rows: display lines holding PR-DELETED code, merged
     /// inline (struck through). Empty for normal tabs.
     ghost_rows: Vec<usize>,
@@ -104,7 +106,10 @@ impl Tab {
         outline: Vec<DocSymbol>,
     ) -> Self {
         let line_count = content.lines().count().max(1);
+        // Markdown opens rendered by default (toggle back to raw any time).
+        let md_preview = is_md_path(&path);
         Self {
+            md_preview,
             edit_buf: content.clone(),
             path,
             content,
@@ -364,6 +369,43 @@ enum LeftView {
     Project,
     Commit,
     Review,
+    Activity,
+}
+
+fn is_md_path(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+        .unwrap_or(false)
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Paths the live watcher ignores (VCS + build junk).
+fn watch_noise(p: &Path) -> bool {
+    p.components().any(|c| {
+        matches!(
+            c.as_os_str().to_str(),
+            Some(
+                ".git"
+                    | "target"
+                    | "node_modules"
+                    | ".idea"
+                    | "build"
+                    | "dist"
+                    | ".gradle"
+                    | "__pycache__"
+                    | ".next"
+                    | ".venv"
+                    | ".DS_Store"
+            )
+        )
+    })
 }
 
 /// Single status letter for changed-file lists.
@@ -529,6 +571,21 @@ pub struct Workspace {
     submit_body: String,
     submit_event: usize, // 0 = COMMENT, 1 = APPROVE, 2 = REQUEST_CHANGES
     submit_rx: Option<Receiver<Result<String, String>>>,
+    // AI Watch: live file watcher + activity feed (newest first).
+    watcher: Option<notify::RecommendedWatcher>,
+    watch_rx: Option<Receiver<notify::Result<notify::Event>>>,
+    feed: Vec<FeedEntry>,
+    /// Last watcher-triggered git-status refresh (throttle).
+    watch_refresh_at: Option<f64>,
+}
+
+/// One row of the AI-Watch activity feed.
+struct FeedEntry {
+    path: PathBuf,
+    rel: String,
+    /// Unix seconds of the LAST event on this path (bursts coalesce).
+    at: i64,
+    kind: u8, // 0 = modified, 1 = created, 2 = removed
 }
 
 impl Workspace {
@@ -624,6 +681,10 @@ impl Workspace {
             submit_body: String::new(),
             submit_event: 0,
             submit_rx: None,
+            watcher: None,
+            watch_rx: None,
+            feed: Vec::new(),
+            watch_refresh_at: None,
         }
     }
 
@@ -666,6 +727,10 @@ pub struct CodeLookApp {
     /// In-flight PR review worktree creation → (worktree path, PR number).
     /// App-level: completion opens a NEW project workspace.
     worktree_rx: Option<Receiver<Result<(PathBuf, u64), String>>>,
+    /// AI Watch follow mode: the editor jumps to whatever was just changed.
+    follow_ai: bool,
+    /// Markdown renderer cache (images, syntax-highlighted code blocks).
+    md_cache: egui_commonmark::CommonMarkCache,
 }
 
 impl CodeLookApp {
@@ -677,6 +742,7 @@ impl CodeLookApp {
     ) -> Self {
         setup_fonts(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx);
+        egui_extras::install_image_loaders(&cc.egui_ctx);
 
         let restored = cc
             .storage
@@ -712,6 +778,8 @@ impl CodeLookApp {
             shot_frame: 0,
             _menu: None,
             worktree_rx: None,
+            follow_ai: false,
+            md_cache: egui_commonmark::CommonMarkCache::default(),
         };
 
         // Native macOS menu bar (open / search / zoom / settings live there,
@@ -965,6 +1033,26 @@ impl CodeLookApp {
             ctx3.request_repaint();
         });
         self.ws.git_rx = Some(grx);
+
+        // Live file watcher (AI Watch): instant reaction to outside edits —
+        // an agent in a terminal, another editor, a checkout. FSEvents-based
+        // on macOS, so a huge root is fine. Skipped in capture mode.
+        if self.shot.is_none() {
+            let (wtx, wrx) = std::sync::mpsc::channel();
+            let wctx = ctx.clone();
+            let watcher = notify::recommended_watcher(move |res| {
+                let _ = wtx.send(res);
+                wctx.request_repaint();
+            })
+            .ok()
+            .and_then(|mut w| {
+                use notify::Watcher;
+                w.watch(&path, notify::RecursiveMode::Recursive).ok()?;
+                Some(w)
+            });
+            self.ws.watch_rx = watcher.is_some().then_some(wrx);
+            self.ws.watcher = watcher;
+        }
 
         // For a git repository, open the commit log automatically and load it.
         self.ws.log_open = false;
@@ -2493,13 +2581,17 @@ impl CodeLookApp {
 
         self.record_origin();
         self.ws.diff_view = None;
+        // The file under review always sits at the FIRST tab slot, so the
+        // eye never hunts for it in a long tab strip.
         if let Some(i) = self
             .ws
             .tabs
             .iter()
             .position(|t| t.is_review && t.path == path)
         {
-            self.ws.active = Some(i);
+            let t = self.ws.tabs.remove(i);
+            self.ws.tabs.insert(0, t);
+            self.ws.active = Some(0);
         } else {
             let content = if from_disk {
                 std::fs::read_to_string(&path).ok()
@@ -2525,10 +2617,12 @@ impl CodeLookApp {
             let mut tab = Tab::new(path.clone(), content, job, self.font_size, lang, outline);
             tab.git_changes = overlay;
             tab.is_review = true;
+            // Review defaults to raw text — the change overlay lives there.
+            tab.md_preview = false;
             tab.ghost_rows = ghost_rows;
             tab.ghost_ranges = ghost_ranges;
-            self.ws.tabs.push(tab);
-            self.ws.active = Some(self.ws.tabs.len() - 1);
+            self.ws.tabs.insert(0, tab);
+            self.ws.active = Some(0);
             self.refresh_search();
         }
         // First change in DISPLAY lines (the tab's overlay is already
@@ -2572,6 +2666,170 @@ impl CodeLookApp {
             job,
             jobs_font: self.font_size,
         });
+    }
+
+    // ---- AI Watch (live file watcher) -----------------------------------
+
+    /// Pump the live watcher every frame: fold events into the activity
+    /// feed, hot-reload open tabs, refresh git status (throttled) and drive
+    /// follow mode.
+    fn pump_watcher(&mut self, ctx: &egui::Context) {
+        // Parked workspaces: keep their channels drained (feed bookkeeping
+        // only, so nothing accumulates unbounded).
+        for w in &mut self.parked {
+            Self::drain_ws_events(w);
+        }
+        let touched = Self::drain_ws_events(&mut self.ws);
+        if touched.is_empty() {
+            return;
+        }
+        for p in &touched {
+            self.reload_tab_from_disk(p);
+        }
+        let now = ctx.input(|i| i.time);
+        if self.ws.watch_refresh_at.is_none_or(|t| now - t > 3.0) {
+            self.ws.watch_refresh_at = Some(now);
+            self.refresh_git_status(ctx);
+        }
+        if self.follow_ai {
+            if let Some(p) = touched.iter().rev().find(|p| p.is_file()) {
+                self.follow_open(p.clone());
+            }
+        }
+    }
+
+    /// Drain one workspace's watcher channel into its feed (one row per
+    /// path, newest first). Returns the created/modified files.
+    fn drain_ws_events(ws: &mut Workspace) -> Vec<PathBuf> {
+        let Some(rx) = &ws.watch_rx else {
+            return Vec::new();
+        };
+        let root = ws.project_root.clone().unwrap_or_default();
+        let mut touched: Vec<(PathBuf, u8)> = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(Ok(ev)) => {
+                    use notify::EventKind::*;
+                    let kind = match ev.kind {
+                        Create(_) => 1u8,
+                        Remove(_) => 2,
+                        Modify(_) | Any | Other => 0,
+                        Access(_) => continue,
+                    };
+                    for p in ev.paths {
+                        if !p.starts_with(&root) || watch_noise(&p) {
+                            continue;
+                        }
+                        if kind != 2 && !p.is_file() {
+                            continue; // directory churn is noise
+                        }
+                        if let Some(t) = touched.iter_mut().find(|(q, _)| *q == p) {
+                            t.1 = t.1.max(kind);
+                        } else {
+                            touched.push((p, kind));
+                        }
+                    }
+                }
+                Ok(Err(_)) => {}
+                Err(_) => break,
+            }
+        }
+        let mut out = Vec::new();
+        if touched.is_empty() {
+            return out;
+        }
+        let now = unix_now();
+        for (p, kind) in touched {
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string();
+            ws.feed.retain(|e| e.path != p);
+            ws.feed.insert(
+                0,
+                FeedEntry {
+                    path: p.clone(),
+                    rel,
+                    at: now,
+                    kind,
+                },
+            );
+            if kind != 2 {
+                out.push(p);
+            }
+        }
+        ws.feed.truncate(200);
+        out
+    }
+
+    /// Hot-reload an open (non-review) tab whose file changed on disk,
+    /// keeping the caret roughly in place.
+    fn reload_tab_from_disk(&mut self, path: &Path) {
+        let Some(i) = self
+            .ws
+            .tabs
+            .iter()
+            .position(|t| !t.is_review && t.path == path)
+        else {
+            return;
+        };
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        if content == self.ws.tabs[i].content {
+            return;
+        }
+        let job = self
+            .highlighter
+            .highlight(path.to_str().unwrap_or(""), &content, self.font_size);
+        let lang = ast::Lang::from_path(path);
+        let outline = lang
+            .map(|l| ast::document_symbols(l, &content))
+            .unwrap_or_default();
+        let root = self.ws.project_root.clone().unwrap_or_default();
+        let git_changes = crate::git::file_line_changes(&root, path).unwrap_or_default();
+        let t = &mut self.ws.tabs[i];
+        let lc = content.lines().count().max(1);
+        t.line_count = lc;
+        t.edit_buf = content.clone();
+        t.content = content;
+        t.job = job;
+        t.job_font = self.font_size;
+        t.outline = outline;
+        t.git_changes = git_changes;
+        t.render_font = -1.0; // rebuild gutter + code width
+        t.caret_line = t.caret_line.map(|l| l.min(lc - 1));
+        t.caret_ci = None;
+        t.last_cursor_ci = None;
+        if self.ws.active == Some(i) {
+            self.refresh_search();
+        }
+    }
+
+    /// Follow mode: surface the just-changed file at its latest change,
+    /// WITHOUT touching nav history (an agent editing 30 files must not
+    /// bury the user's own trail).
+    fn follow_open(&mut self, path: PathBuf) {
+        let line = self
+            .ws
+            .project_root
+            .as_ref()
+            .and_then(|r| crate::git::file_line_changes(r, &path))
+            .and_then(|d| d.changed.last().map(|&(l, _)| l))
+            .unwrap_or(0);
+        if let Some(i) = self
+            .ws
+            .tabs
+            .iter()
+            .position(|t| !t.is_review && t.path == path)
+        {
+            self.ws.active = Some(i);
+            self.ws.diff_view = None;
+            self.set_jump_target(line);
+        } else if self.open_tab_from_disk(path) {
+            self.set_jump_target(line);
+        }
     }
 
     /// Refresh the working-tree status (and branch / ahead-behind) in the
@@ -2858,6 +3116,8 @@ impl eframe::App for CodeLookApp {
             }
         }
 
+        self.pump_watcher(ctx);
+
         // A finished review-worktree checkout opens as its own project.
         if let Some(rx) = &self.worktree_rx {
             if let Ok(res) = rx.try_recv() {
@@ -3140,6 +3400,7 @@ impl CodeLookApp {
                         LeftView::Project => self.project_tree_view(ui),
                         LeftView::Commit => self.commit_sidebar(ui),
                         LeftView::Review => self.review_sidebar(ui),
+                        LeftView::Activity => self.activity_sidebar(ui),
                     });
                 });
             });
@@ -3214,6 +3475,7 @@ impl CodeLookApp {
             (LeftView::Project, "프로젝트".to_string()),
             (LeftView::Commit, format!("변경사항 (커밋 전) — {n_changes}개 파일")),
             (LeftView::Review, review_tip),
+            (LeftView::Activity, "AI 활동 (라이브 감시)".to_string()),
         ]
         .into_iter()
         .enumerate()
@@ -3256,6 +3518,40 @@ impl CodeLookApp {
                             egui::pos2(r.right() - 3.0, r.top() + 3.0),
                             3.0,
                             Color32::from_rgb(0xc5, 0x95, 0xff),
+                        );
+                    }
+                }
+                LeftView::Activity => {
+                    // Pulse (heartbeat) glyph.
+                    let c = if active { C_TEXT } else { C_TEXT_DIM };
+                    let st = Stroke::new(1.4, c);
+                    let cy = r.center().y;
+                    let cx = r.center().x;
+                    let pts = [
+                        (r.left() + 3.0, cy),
+                        (cx - 4.0, cy),
+                        (cx - 2.0, cy - 5.0),
+                        (cx + 2.0, cy + 5.0),
+                        (cx + 4.0, cy),
+                        (r.right() - 3.0, cy),
+                    ];
+                    for w in pts.windows(2) {
+                        p.line_segment(
+                            [egui::pos2(w[0].0, w[0].1), egui::pos2(w[1].0, w[1].1)],
+                            st,
+                        );
+                    }
+                    // Green dot = activity within the last minute.
+                    if self
+                        .ws
+                        .feed
+                        .first()
+                        .is_some_and(|e| unix_now() - e.at < 60)
+                    {
+                        p.circle_filled(
+                            egui::pos2(r.right() - 3.0, r.top() + 3.0),
+                            3.0,
+                            Color32::from_rgb(0x62, 0xb5, 0x43),
                         );
                     }
                 }
@@ -3916,6 +4212,135 @@ impl CodeLookApp {
         }
     }
 
+    /// AI-Watch panel: live feed of outside edits (an agent in a terminal,
+    /// another editor), with follow mode to watch the work happen.
+    fn activity_sidebar(&mut self, ui: &mut egui::Ui) {
+        self.left_header(ui, "AI WATCH", false);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            ui.checkbox(&mut self.follow_ai, "");
+            ui.label(
+                egui::RichText::new("팔로우 모드 — 바뀐 곳으로 자동 이동")
+                    .color(C_TEXT_DIM)
+                    .size(11.5),
+            );
+        });
+        let mut clear = false;
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new("터미널 AI 등 외부 편집을 실시간 감지")
+                    .color(C_TEXT_DIM)
+                    .size(10.5),
+            );
+            if !self.ws.feed.is_empty() && ui.small_button("비우기").clicked() {
+                clear = true;
+            }
+        });
+        ui.add_space(6.0);
+
+        let now = unix_now();
+        let mut open: Option<PathBuf> = None;
+        egui::ScrollArea::vertical()
+            .id_salt(("activity_feed", self.ws.seq))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                if self.ws.feed.is_empty() {
+                    ui.add_space(16.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("아직 감지된 외부 변경이 없습니다")
+                                .color(C_TEXT_DIM)
+                                .size(11.5),
+                        );
+                    });
+                }
+                for (i, e) in self.ws.feed.iter().enumerate() {
+                    let (rr, resp) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 34.0),
+                        Sense::click(),
+                    );
+                    let p = ui.painter();
+                    if resp.hovered() {
+                        p.rect_filled(rr, 0.0, C_HOVER);
+                    }
+                    let (letter, col) = match e.kind {
+                        1 => ("A", Color32::from_rgb(0x62, 0xb5, 0x43)),
+                        2 => ("D", Color32::from_rgb(0xe0, 0x6c, 0x75)),
+                        _ => ("M", Color32::from_rgb(0x6c, 0x9c, 0xd2)),
+                    };
+                    let y1 = rr.top() + 11.0;
+                    let y2 = rr.top() + 25.0;
+                    p.text(
+                        egui::pos2(rr.left() + 10.0, y1),
+                        Align2::LEFT_CENTER,
+                        letter,
+                        FontId::monospace(11.5),
+                        col,
+                    );
+                    // Right-aligned "n초 전".
+                    let when = rel_time(now - e.at);
+                    let wg = p.layout_no_wrap(when, FontId::proportional(10.5), C_TEXT_DIM);
+                    p.galley(
+                        egui::pos2(rr.right() - 8.0 - wg.size().x, y1 - wg.size().y / 2.0),
+                        wg.clone(),
+                        C_TEXT_DIM,
+                    );
+                    let name = e.rel.rsplit('/').next().unwrap_or(&e.rel);
+                    let dir = e.rel[..e.rel.len() - name.len()].trim_end_matches('/');
+                    let clip = Rect::from_min_max(
+                        rr.min,
+                        egui::pos2(rr.right() - 14.0 - wg.size().x, rr.bottom()),
+                    );
+                    let pc = ui.painter().with_clip_rect(clip);
+                    pc.text(
+                        egui::pos2(rr.left() + 26.0, y1),
+                        Align2::LEFT_CENTER,
+                        name,
+                        FontId::proportional(12.5),
+                        C_TEXT,
+                    );
+                    let pd = ui.painter().with_clip_rect(Rect::from_min_max(
+                        rr.min,
+                        egui::pos2(rr.right() - 8.0, rr.bottom()),
+                    ));
+                    pd.text(
+                        egui::pos2(rr.left() + 26.0, y2),
+                        Align2::LEFT_CENTER,
+                        dir,
+                        FontId::proportional(10.5),
+                        C_TEXT_DIM,
+                    );
+                    let _ = i;
+                    if e.kind != 2 && resp.on_hover_text(&e.rel).clicked() {
+                        open = Some(e.path.clone());
+                    }
+                }
+                ui.add_space(6.0);
+            });
+
+        if clear {
+            self.ws.feed.clear();
+        }
+        if let Some(p) = open {
+            // A deliberate click IS a navigation point (unlike follow mode).
+            let line = self
+                .ws
+                .project_root
+                .as_ref()
+                .and_then(|r| crate::git::file_line_changes(r, &p))
+                .and_then(|d| d.changed.last().map(|&(l, _)| l))
+                .unwrap_or(0);
+            self.record_origin();
+            self.open_file(p.clone());
+            self.set_jump_target(line);
+            self.record_nav(p, line);
+        }
+    }
+
     /// Uncommitted changes as sorted (relative path, status) pairs.
     fn local_changes(&self) -> Vec<(String, crate::git::FileStatus)> {
         let root = self.ws.project_root.clone().unwrap_or_default();
@@ -4364,9 +4789,9 @@ impl CodeLookApp {
                                         // tabs / wide glyphs stay aligned.
                                         for &(ci, len) in &preview_marks {
                                             let a = c_galley
-                                                .pos_from_ccursor(egui::text::CCursor::new(ci));
+                                                .pos_from_cursor(egui::text::CCursor::new(ci));
                                             let b = c_galley
-                                                .pos_from_ccursor(egui::text::CCursor::new(ci + len));
+                                                .pos_from_cursor(egui::text::CCursor::new(ci + len));
                                             let mrect = Rect::from_min_max(
                                                 c_rect.min + Vec2::new(a.left() - 1.0, a.top() + 1.0),
                                                 c_rect.min + Vec2::new(b.left() + 1.0, a.bottom() - 1.0),
@@ -4386,8 +4811,8 @@ impl CodeLookApp {
                                             // the whole-line band, which would center
                                             // on the middle/last match).
                                             let a = c_galley
-                                                .pos_from_ccursor(egui::text::CCursor::new(focus_ci));
-                                            let b = c_galley.pos_from_ccursor(
+                                                .pos_from_cursor(egui::text::CCursor::new(focus_ci));
+                                            let b = c_galley.pos_from_cursor(
                                                 egui::text::CCursor::new(focus_ci + needle_len_char),
                                             );
                                             let frect = Rect::from_min_max(
@@ -5258,7 +5683,7 @@ impl CodeLookApp {
 
                     // The diff body: read-only TextEdit → drag-select + ⌘C.
                     let job_for_layouter = diff.job.clone();
-                    let mut layouter = move |ui: &egui::Ui, _buf: &str, _w: f32| {
+                    let mut layouter = move |ui: &egui::Ui, _buf: &dyn egui::TextBuffer, _w: f32| {
                         ui.fonts(|f| f.layout_job(job_for_layouter.clone()))
                     };
                     let out = egui::TextEdit::multiline(&mut diff.edit_buf)
@@ -5527,6 +5952,12 @@ impl CodeLookApp {
             _ => return,
         };
 
+        // Markdown in rendered mode: draw the document, not the source.
+        if self.ws.tabs[idx].md_preview {
+            self.md_view(ui, idx);
+            return;
+        }
+
         let cmd_held = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
         let gutter_color = Color32::from_rgb(0x4b, 0x50, 0x58);
         let font = FontId::monospace(self.font_size);
@@ -5559,7 +5990,7 @@ impl CodeLookApp {
 
         // Layouter feeds the cached highlighted job to the TextEdit.
         let job_for_layouter = self.ws.tabs[idx].job.clone();
-        let mut layouter = move |ui: &egui::Ui, _buf: &str, _w: f32| {
+        let mut layouter = move |ui: &egui::Ui, _buf: &dyn egui::TextBuffer, _w: f32| {
             ui.fonts(|f| f.layout_job(job_for_layouter.clone()))
         };
 
@@ -5665,8 +6096,11 @@ impl CodeLookApp {
                     // caret move (click / drag / arrow keys) may update our
                     // tracked position.
                     if let Some(cur) = out.cursor_range {
-                        let row = cur.primary.rcursor.row;
-                        let ci = cur.primary.ccursor.index;
+                        let ci = cur.primary.index;
+                        let row = ((out.galley.pos_from_cursor(cur.primary).top()
+                            / row_h.max(1.0))
+                            .round()
+                            .max(0.0)) as usize;
                         if tab.last_cursor_ci != Some(ci) || out.response.clicked() {
                             tab.last_cursor_ci = Some(ci);
                             tab.caret_ci = Some(ci);
@@ -5831,10 +6265,10 @@ impl CodeLookApp {
                         // falling back to a galley lookup.
                         let char_idx = out
                             .cursor_range
-                            .map(|r| r.primary.ccursor.index)
+                            .map(|r| r.primary.index)
                             .or_else(|| {
                                 out.response.interact_pointer_pos().map(|p| {
-                                    out.galley.cursor_from_pos(p - out.galley_pos).ccursor.index
+                                    out.galley.cursor_from_pos(p - out.galley_pos).index
                                 })
                             });
                         if let Some(ci) = char_idx {
@@ -5940,6 +6374,10 @@ impl CodeLookApp {
                     }
                 }
             }
+        }
+
+        if is_md_path(&self.ws.tabs[idx].path) {
+            self.md_toggle(ui, pane, idx);
         }
 
         if clear_scroll {
@@ -6305,6 +6743,74 @@ fn review_tree_rows(
             acts.open_diff = Some(i);
         } else if resp.on_hover_text(&f.path).clicked() {
             acts.open_file = Some(i);
+        }
+    }
+}
+
+impl CodeLookApp {
+    /// Rendered Markdown document (read-only preview, centered column).
+    fn md_view(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let pane = ui.max_rect();
+        egui::ScrollArea::vertical()
+            .id_salt(("md_scroll", self.ws.seq, idx))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    ui.vertical(|ui| {
+                        ui.set_max_width((pane.width() - 72.0).min(880.0));
+                        egui_commonmark::CommonMarkViewer::new().show(
+                            ui,
+                            &mut self.md_cache,
+                            &self.ws.tabs[idx].content,
+                        );
+                    });
+                });
+                ui.add_space(28.0);
+            });
+        self.md_toggle(ui, pane, idx);
+    }
+
+    /// Raw ↔ rendered toggle for Markdown tabs (floating, pane top-right).
+    fn md_toggle(&mut self, ui: &mut egui::Ui, pane: Rect, idx: usize) {
+        let preview = self.ws.tabs[idx].md_preview;
+        let mut set: Option<bool> = None;
+        egui::Area::new(ui.id().with(("md_toggle", self.ws.seq)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(pane.right() - 140.0, pane.top() + 6.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::default()
+                    .fill(C_PANEL)
+                    .stroke(Stroke::new(1.0, C_BORDER))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(4, 2))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            if ui
+                                .selectable_label(
+                                    !preview,
+                                    egui::RichText::new("원본").size(11.0),
+                                )
+                                .clicked()
+                            {
+                                set = Some(false);
+                            }
+                            if ui
+                                .selectable_label(
+                                    preview,
+                                    egui::RichText::new("미리보기").size(11.0),
+                                )
+                                .clicked()
+                            {
+                                set = Some(true);
+                            }
+                        });
+                    });
+            });
+        if let Some(v) = set {
+            self.ws.tabs[idx].md_preview = v;
         }
     }
 }

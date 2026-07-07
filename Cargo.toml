@@ -9,8 +9,8 @@ name = "codelook"
 path = "src/main.rs"
 
 [dependencies]
-eframe = "0.31"
-egui = "0.31"
+eframe = "0.32"
+egui = "0.32"
 syntect = "5.2"
 rfd = "0.15"
 ignore = "0.4"
@@ -29,6 +29,9 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 png = "0.17"
 tree-sitter-typescript = "0.23.2"
 muda = "0.19.3"
+notify = "8.2.0"
+egui_commonmark = "0.21"
+egui_extras = { version = "0.32", features = ["image"] }
 
 [features]
 # Build with `--features shot` to enable `--shot <out.png>` capture mode
